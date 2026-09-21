@@ -24,6 +24,17 @@ CREATE TABLE IF NOT EXISTS vehicles (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Existing motorcycles remain readable; these required fields are enforced for new/edited rows by the API.
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS displacement_cc integer;
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS production_year integer;
+
+CREATE TABLE IF NOT EXISTS vehicle_photos (
+  vehicle_id uuid PRIMARY KEY REFERENCES vehicles(id) ON DELETE CASCADE,
+  mime_type text NOT NULL,
+  image_data bytea NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS appointments (
   id uuid PRIMARY KEY,
   customer_id uuid NOT NULL REFERENCES customers(id) ON DELETE CASCADE,

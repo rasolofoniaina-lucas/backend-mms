@@ -20,6 +20,11 @@ type ScheduledKind = keyof typeof slots;
 const allowedStatuses = ['Confirmé', 'Dépannage demandé', 'Pris en charge', 'En cours', 'Terminé', 'Annulé'];
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+const maxPhotoBytes = 5 * 1024 * 1024;
+const vehicleFields = `v.id, v.name, v.model, v.plate, v.color,
+  v.displacement_cc AS "displacementCc", v.production_year AS year,
+  CASE WHEN p.vehicle_id IS NOT NULL THEN '/api/customers/' || v.customer_id || '/vehicles/' || v.id ||
+    '/photo?updated=' || (extract(epoch from p.updated_at) * 1000)::bigint ELSE NULL END AS "photoUrl"`;
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -32,6 +37,37 @@ function send(res: ServerResponse, status: number, data: unknown) {
 function textField(value: unknown, label: string, min = 0, max = 255): string {
   if (typeof value !== 'string' || value.trim().length < min || value.trim().length > max) throw new HttpError(400, `${label} invalide.`);
   return value.trim();
+}
+function integerField(value: unknown, label: string, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) throw new HttpError(400, `${label} invalide.`);
+  return value;
+}
+function vehicleInput(input: Record<string, unknown>) {
+  return {
+    name: textField(input.name, 'Marque de la moto', 1, 80),
+    displacementCc: integerField(input.displacementCc, 'Cylindrée', 1, 5000),
+    year: integerField(input.year, 'Année de la moto', 1885, new Date().getFullYear() + 1),
+    model: textField(input.model ?? '', 'Modèle', 0, 100),
+    plate: textField(input.plate ?? '', 'Immatriculation', 0, 32).toUpperCase(),
+  };
+}
+async function photoBody(req: IncomingMessage, mimeType: string): Promise<Buffer> {
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) throw new HttpError(415, 'Photo JPEG, PNG ou WebP requise.');
+  if (Number(req.headers['content-length']) > maxPhotoBytes) throw new HttpError(413, 'La photo ne doit pas dépasser 5 Mo.');
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += bytes.length;
+    if (size > maxPhotoBytes) throw new HttpError(413, 'La photo ne doit pas dépasser 5 Mo.');
+    chunks.push(bytes);
+  }
+  const photo = Buffer.concat(chunks);
+  const valid = mimeType === 'image/jpeg' ? photo.length >= 3 && photo.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+    : mimeType === 'image/png' ? photo.length >= 8 && photo.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      : photo.length >= 12 && photo.toString('ascii', 0, 4) === 'RIFF' && photo.toString('ascii', 8, 12) === 'WEBP';
+  if (!valid) throw new HttpError(400, 'Le fichier ne correspond pas au format de photo indiqué.');
+  return photo;
 }
 function uuid(value: string | undefined): string {
   if (!value || !uuidPattern.test(value)) throw new HttpError(400, 'Identifiant invalide.');
@@ -62,11 +98,18 @@ async function customerExists(id: string) {
   const result = await pool.query('SELECT 1 FROM customers WHERE id = $1', [id]);
   if (!result.rowCount) throw new HttpError(404, 'Client introuvable.');
 }
+async function vehicleData(customerId: string, vehicleId: string) {
+  const result = await pool.query(`SELECT ${vehicleFields} FROM vehicles v
+    LEFT JOIN vehicle_photos p ON p.vehicle_id = v.id WHERE v.customer_id = $1 AND v.id = $2`, [customerId, vehicleId]);
+  if (!result.rowCount) throw new HttpError(404, 'Moto introuvable pour ce client.');
+  return result.rows[0];
+}
 async function customerData(id: string) {
   const customer = await pool.query('SELECT name, phone FROM customers WHERE id = $1', [id]);
   if (!customer.rowCount) throw new HttpError(404, 'Client introuvable.');
   const [vehicles, appointments, maintenance, messages] = await Promise.all([
-    pool.query('SELECT id, name, model, plate, color FROM vehicles WHERE customer_id = $1 ORDER BY created_at', [id]),
+    pool.query(`SELECT ${vehicleFields} FROM vehicles v LEFT JOIN vehicle_photos p ON p.vehicle_id = v.id
+      WHERE v.customer_id = $1 ORDER BY v.created_at`, [id]),
     pool.query(`SELECT id, vehicle_id AS "vehicleId", problem, diagnosis, kind, address,
       to_char(appointment_date, 'YYYY-MM-DD') AS date, to_char(appointment_time, 'HH24:MI') AS time,
       status, contact_phone AS "contactPhone", immobilized, mechanic_note AS "mechanicNote"
@@ -165,14 +208,49 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     }
     if (method === 'POST' && parts[3] === 'vehicles' && parts.length === 4) {
       const input = await body(req);
-      const name = textField(input.name, 'Marque et modèle', 2, 100);
-      const model = textField(input.model, 'Version ou année', 1, 100);
-      const plate = textField(input.plate, 'Immatriculation', 2, 32).toUpperCase();
+      const vehicle = vehicleInput(input);
       await customerExists(customerId);
       const id = randomUUID();
-      const result = await pool.query(`INSERT INTO vehicles (id, customer_id, name, model, plate, color)
-        VALUES ($1, $2, $3, $4, $5, '#dce8ef') RETURNING id, name, model, plate, color`, [id, customerId, name, model, plate]);
-      return send(res, 201, result.rows[0]);
+      await pool.query(`INSERT INTO vehicles (id, customer_id, name, model, plate, displacement_cc, production_year)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, customerId, vehicle.name, vehicle.model, vehicle.plate, vehicle.displacementCc, vehicle.year]);
+      return send(res, 201, await vehicleData(customerId, id));
+    }
+    if (parts[3] === 'vehicles' && parts[4] && parts.length >= 5) {
+      const vehicleId = uuid(parts[4]);
+      if (method === 'PATCH' && parts.length === 5) {
+        const input = vehicleInput(await body(req));
+        const updated = await pool.query(`UPDATE vehicles SET name = $3, model = $4, plate = $5,
+          displacement_cc = $6, production_year = $7 WHERE id = $1 AND customer_id = $2 RETURNING id`,
+        [vehicleId, customerId, input.name, input.model, input.plate, input.displacementCc, input.year]);
+        if (!updated.rowCount) throw new HttpError(404, 'Moto introuvable pour ce client.');
+        return send(res, 200, await vehicleData(customerId, vehicleId));
+      }
+      if (parts[5] === 'photo' && parts.length === 6) {
+        if (method === 'GET') {
+          const photo = await pool.query(`SELECT p.mime_type, p.image_data FROM vehicle_photos p
+            JOIN vehicles v ON v.id = p.vehicle_id WHERE v.id = $1 AND v.customer_id = $2`, [vehicleId, customerId]);
+          if (!photo.rowCount) throw new HttpError(404, 'Photo introuvable.');
+          const bytes: Buffer = photo.rows[0].image_data;
+          res.writeHead(200, { 'Content-Type': photo.rows[0].mime_type, 'Content-Length': bytes.length,
+            'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+          return res.end(bytes);
+        }
+        if (method === 'PUT') {
+          await vehicleData(customerId, vehicleId);
+          const mimeType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+          const image = await photoBody(req, mimeType);
+          await pool.query(`INSERT INTO vehicle_photos (vehicle_id, mime_type, image_data) VALUES ($1, $2, $3)
+            ON CONFLICT (vehicle_id) DO UPDATE SET mime_type = EXCLUDED.mime_type,
+              image_data = EXCLUDED.image_data, updated_at = now()`, [vehicleId, mimeType, image]);
+          return send(res, 200, await vehicleData(customerId, vehicleId));
+        }
+        if (method === 'DELETE') {
+          await vehicleData(customerId, vehicleId);
+          await pool.query('DELETE FROM vehicle_photos WHERE vehicle_id = $1', [vehicleId]);
+          return send(res, 200, await vehicleData(customerId, vehicleId));
+        }
+      }
     }
     if (method === 'POST' && parts[3] === 'appointments' && parts.length === 4) {
       const input = await body(req);
@@ -231,12 +309,14 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (method === 'GET' && parts.length === 3) {
       const result = await pool.query(`SELECT a.id, a.customer_id AS "customerId", c.name AS "customerName",
         c.phone AS "customerPhone", v.name AS "vehicleName", v.model AS "vehicleModel", v.plate,
+        CASE WHEN p.vehicle_id IS NOT NULL THEN '/api/customers/' || v.customer_id || '/vehicles/' || v.id ||
+          '/photo?updated=' || (extract(epoch from p.updated_at) * 1000)::bigint ELSE NULL END AS "vehiclePhotoUrl",
         a.problem, a.diagnosis, a.kind, a.address,
         to_char(a.appointment_date, 'YYYY-MM-DD') AS date,
         to_char(a.appointment_time, 'HH24:MI') AS time,
         a.status, a.contact_phone AS "contactPhone", a.immobilized, a.mechanic_note AS "mechanicNote"
         FROM appointments a JOIN customers c ON c.id = a.customer_id
-        JOIN vehicles v ON v.id = a.vehicle_id ORDER BY
+        JOIN vehicles v ON v.id = a.vehicle_id LEFT JOIN vehicle_photos p ON p.vehicle_id = v.id ORDER BY
         CASE WHEN a.kind = 'Urgence' AND a.status NOT IN ('Terminé','Annulé') THEN 0 ELSE 1 END,
         a.appointment_date DESC, a.appointment_time DESC`);
       return send(res, 200, result.rows);

@@ -13,6 +13,8 @@ L'API est disponible sur <http://localhost:8080/api/health> via Nginx, et sur `1
 
 Routes principales : `POST /api/customers`, `GET/PATCH /api/customers/:id`, `POST /api/customers/:id/phone-change`, `POST /api/customers/:id/phone-change/confirm`, `POST /api/customers/:id/vehicles`, `POST /api/customers/:id/appointments`, `PATCH /api/customers/:id/appointments/:id/cancel`, `GET /api/availability`, `GET /api/mechanic/appointments`, `PATCH /api/mechanic/appointments/:id`.
 
+Les motos acceptent aussi `PATCH /api/customers/:id/vehicles/:vehicleId` (modifier la fiche) et `GET/PUT/DELETE /api/customers/:id/vehicles/:vehicleId/photo`. À la création ou modification, `name` (marque), `displacementCc` (entier 1–5000) et `year` (1885 à l'année prochaine) sont requis ; `model` et `plate` peuvent être vides. L'envoi photo utilise le corps binaire avec `Content-Type: image/jpeg`, `image/png` ou `image/webp`, vérifie la signature du fichier et limite sa taille à 5 Mo. Les octets sont stockés dans PostgreSQL. Les anciennes motos sans les nouveaux champs restent lisibles et peuvent être mises à jour.
+
 Le numéro ne se modifie pas par `PATCH /customers/:id` : il faut d'abord demander un changement, puis confirmer son challenge. En mode test, le serveur renvoie le code fixe `000000` dans la réponse de demande ; il expire après 10 minutes et autorise cinq essais. Aucun SMS n'est envoyé. L'inscription ne demande pas encore d'OTP.
 
 La base bloque les doubles réservations actives pour un même type d'intervention, jour et créneau. Le dépannage n'a pas de créneau. Les statuts et notes enregistrés par le mécanicien sont visibles côté client après rafraîchissement.
