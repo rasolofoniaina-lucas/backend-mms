@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
 
 if (process.env.MMS_TEST_MODE !== '1') {
@@ -36,6 +36,9 @@ function textField(value: unknown, label: string, min = 0, max = 255): string {
 function uuid(value: string | undefined): string {
   if (!value || !uuidPattern.test(value)) throw new HttpError(400, 'Identifiant invalide.');
   return value;
+}
+function codeHash(challengeId: string, code: string) {
+  return createHash('sha256').update(`${challengeId}:${code}`).digest('hex');
 }
 async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
   let raw = '';
@@ -96,8 +99,12 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     return send(res, 200, { slots: slots[kind], occupied: occupied.rows.map(row => row.time) });
   }
   if (method === 'POST' && parts[1] === 'customers' && parts.length === 2) {
+    const input = await body(req);
+    const hasProfile = input.name !== undefined || input.phone !== undefined;
+    const name = hasProfile ? textField(input.name, 'Prénom', 1, 80) : 'Motard';
+    const phone = hasProfile ? textField(input.phone, 'Téléphone', 6, 40) : '';
     const id = randomUUID();
-    await pool.query('INSERT INTO customers (id, name, phone) VALUES ($1, $2, $3)', [id, 'Motard', '']);
+    await pool.query('INSERT INTO customers (id, name, phone) VALUES ($1, $2, $3)', [id, name, phone]);
     return send(res, 201, { id, data: await customerData(id) });
   }
   if (parts[1] === 'customers' && parts[2]) {
@@ -106,10 +113,55 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (method === 'PATCH' && parts.length === 3) {
       const input = await body(req);
       const name = textField(input.name, 'Prénom', 1, 80);
-      const phone = textField(input.phone, 'Téléphone', 6, 40);
-      const result = await pool.query('UPDATE customers SET name = $2, phone = $3 WHERE id = $1 RETURNING name, phone', [customerId, name, phone]);
+      if (input.phone !== undefined) throw new HttpError(400, 'Le changement de numéro requiert une confirmation OTP.');
+      const result = await pool.query('UPDATE customers SET name = $2 WHERE id = $1 RETURNING name, phone', [customerId, name]);
       if (!result.rowCount) throw new HttpError(404, 'Client introuvable.');
       return send(res, 200, result.rows[0]);
+    }
+    if (method === 'POST' && parts[3] === 'phone-change' && parts.length === 4) {
+      const input = await body(req);
+      const phone = textField(input.phone, 'Nouveau numéro', 6, 40);
+      const customer = await pool.query('SELECT phone FROM customers WHERE id = $1', [customerId]);
+      if (!customer.rowCount) throw new HttpError(404, 'Client introuvable.');
+      if (customer.rows[0].phone === phone) throw new HttpError(400, 'Le nouveau numéro doit être différent de l’actuel.');
+      const challengeId = randomUUID();
+      const testCode = '000000';
+      await pool.query(`INSERT INTO phone_change_challenges (customer_id, challenge_id, new_phone, code_hash, expires_at, attempts)
+        VALUES ($1, $2, $3, $4, now() + interval '10 minutes', 0)
+        ON CONFLICT (customer_id) DO UPDATE SET challenge_id = EXCLUDED.challenge_id, new_phone = EXCLUDED.new_phone,
+          code_hash = EXCLUDED.code_hash, expires_at = EXCLUDED.expires_at, attempts = 0`,
+      [customerId, challengeId, phone, codeHash(challengeId, testCode)]);
+      return send(res, 200, { challengeId, testCode, expiresInSeconds: 600 });
+    }
+    if (method === 'POST' && parts[3] === 'phone-change' && parts[4] === 'confirm' && parts.length === 5) {
+      const input = await body(req);
+      const challengeId = uuid(typeof input.challengeId === 'string' ? input.challengeId : undefined);
+      const code = textField(input.code, 'Code OTP', 6, 6);
+      if (!/^\d{6}$/.test(code)) throw new HttpError(400, 'Le code OTP doit contenir six chiffres.');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const challenge = await client.query(`SELECT challenge_id, new_phone, code_hash, expires_at, attempts
+          FROM phone_change_challenges WHERE customer_id = $1 FOR UPDATE`, [customerId]);
+        if (!challenge.rowCount || challenge.rows[0].challenge_id !== challengeId) throw new HttpError(400, 'Demande OTP introuvable. Recommencez.');
+        const pending = challenge.rows[0];
+        if (new Date(pending.expires_at) < new Date()) throw new HttpError(410, 'Code OTP expiré. Recommencez.');
+        if (pending.attempts >= 5) throw new HttpError(429, 'Trop de tentatives. Demandez un nouveau code.');
+        const expected = Buffer.from(pending.code_hash, 'hex');
+        const received = Buffer.from(codeHash(challengeId, code), 'hex');
+        if (!timingSafeEqual(expected, received)) {
+          await client.query('UPDATE phone_change_challenges SET attempts = attempts + 1 WHERE customer_id = $1', [customerId]);
+          await client.query('COMMIT');
+          return send(res, 400, { error: 'Code OTP incorrect.' });
+        }
+        const updated = await client.query('UPDATE customers SET phone = $2 WHERE id = $1 RETURNING name, phone', [customerId, pending.new_phone]);
+        await client.query('DELETE FROM phone_change_challenges WHERE customer_id = $1', [customerId]);
+        await client.query('COMMIT');
+        return send(res, 200, updated.rows[0]);
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally { client.release(); }
     }
     if (method === 'POST' && parts[3] === 'vehicles' && parts.length === 4) {
       const input = await body(req);

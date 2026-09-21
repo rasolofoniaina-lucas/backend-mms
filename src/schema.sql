@@ -5,6 +5,15 @@ CREATE TABLE IF NOT EXISTS customers (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS phone_change_challenges (
+  customer_id uuid PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
+  challenge_id uuid NOT NULL,
+  new_phone text NOT NULL,
+  code_hash text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS vehicles (
   id uuid PRIMARY KEY,
   customer_id uuid NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
