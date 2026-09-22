@@ -18,6 +18,24 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS users_active_phone_unique ON users(phone_e164) WHERE status = 'active';
 
+-- Phase A: staff identities share the existing users/session infrastructure.
+ALTER TABLE users ALTER COLUMN phone_e164 DROP NOT NULL;
+ALTER TABLE users ALTER COLUMN phone_verified_at DROP NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password boolean NOT NULL DEFAULT false;
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('customer', 'mechanic', 'workshop_manager', 'admin'));
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (lower(email)) WHERE email IS NOT NULL;
+CREATE INDEX IF NOT EXISTS users_role_status_idx ON users(role, status);
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_identity_shape_check;
+ALTER TABLE users ADD CONSTRAINT users_identity_shape_check CHECK (
+  (role='customer' AND phone_e164 IS NOT NULL AND email IS NULL AND password_hash IS NULL)
+  OR (role IN ('mechanic','workshop_manager','admin') AND phone_e164 IS NULL AND email IS NOT NULL AND password_hash IS NOT NULL)
+);
+
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS first_name text;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_name text;
@@ -126,3 +144,61 @@ CREATE TABLE IF NOT EXISTS messages (
   body text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- The sequence is global and transactional inserts use nextval(), never COUNT()+1.
+CREATE SEQUENCE IF NOT EXISTS ticket_reference_seq;
+CREATE TABLE IF NOT EXISTS tickets (
+  id uuid PRIMARY KEY,
+  reference text NOT NULL UNIQUE,
+  customer_id uuid NOT NULL REFERENCES customers(id),
+  vehicle_id uuid NOT NULL REFERENCES vehicles(id),
+  appointment_id uuid UNIQUE REFERENCES appointments(id),
+  intervention_type text NOT NULL CHECK (intervention_type IN ('Urgence', 'À domicile', 'En atelier')),
+  description text NOT NULL,
+  status text NOT NULL CHECK (status IN ('new','triage','assigned','in_progress','waiting_customer','completed','cancelled')),
+  assigned_mechanic_user_id uuid REFERENCES users(id),
+  created_by_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  cancelled_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS tickets_customer_idx ON tickets(customer_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS tickets_mechanic_idx ON tickets(assigned_mechanic_user_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ticket_events (
+  id bigserial PRIMARY KEY,
+  ticket_id uuid NOT NULL REFERENCES tickets(id),
+  actor_user_id uuid REFERENCES users(id),
+  event_type text NOT NULL CHECK (event_type IN ('ticket_created','status_changed','mechanic_assigned','mechanic_reassigned','ticket_cancelled','ticket_completed')),
+  old_value text,
+  new_value text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ticket_events_ticket_idx ON ticket_events(ticket_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS admin_audit_events (
+  id bigserial PRIMARY KEY,
+  actor_user_id uuid REFERENCES users(id),
+  target_user_id uuid REFERENCES users(id),
+  action text NOT NULL CHECK (action IN ('admin_created_user','admin_disabled_user','admin_enabled_user','admin_reset_password','admin_changed_role')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS admin_audit_actor_idx ON admin_audit_events(actor_user_id, created_at DESC);
+
+-- Backfill each legacy appointment exactly once. Appointment remains the slot truth.
+INSERT INTO tickets (id, reference, customer_id, vehicle_id, appointment_id, intervention_type, description, status, created_by_user_id, created_at, updated_at, completed_at, cancelled_at)
+SELECT gen_random_uuid(), 'MMS-' || extract(year FROM a.created_at)::integer || '-' || lpad(nextval('ticket_reference_seq')::text, 6, '0'),
+  a.customer_id, a.vehicle_id, a.id, a.kind, a.problem,
+  CASE a.status WHEN 'Annulé' THEN 'cancelled' WHEN 'Terminé' THEN 'completed'
+    WHEN 'En cours' THEN 'in_progress' WHEN 'Pris en charge' THEN 'triage' ELSE 'new' END,
+  c.user_id, a.created_at, a.created_at,
+  CASE WHEN a.status='Terminé' THEN a.created_at ELSE NULL END,
+  CASE WHEN a.status='Annulé' THEN a.created_at ELSE NULL END
+FROM appointments a JOIN customers c ON c.id=a.customer_id
+WHERE NOT EXISTS (SELECT 1 FROM tickets t WHERE t.appointment_id=a.id);
+
+INSERT INTO ticket_events (ticket_id, actor_user_id, event_type, new_value, created_at)
+SELECT t.id, t.created_by_user_id, 'ticket_created', t.status, t.created_at
+FROM tickets t WHERE NOT EXISTS (SELECT 1 FROM ticket_events e WHERE e.ticket_id=t.id);
