@@ -4,6 +4,7 @@ import { createSmsProvider, SmsProviderError } from '../src/sms-provider.ts';
 
 const message = { challengeId: 'challenge-test', phone: '+261341234567', code: '012345' };
 const env = { SMS_PROVIDER: 'orange', ORANGE_CLIENT_ID: 'test-id', ORANGE_CLIENT_SECRET: 'test-secret', ORANGE_COUNTRY_SENDER: 'tel:+2610000' };
+const events = [];
 const response = (status, data = {}) => new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 const token = (value, expiresIn = '3600') => response(200, { access_token: value, token_type: 'Bearer', expires_in: expiresIn });
 const calls = [];
@@ -17,7 +18,8 @@ function mockFetch(sequence) {
 }
 function orange(sequence, now = () => 0, overrides = {}) {
   calls.length = 0;
-  return createSmsProvider({ ...env, ...overrides }, { fetchFn: mockFetch(sequence), now });
+  events.length = 0;
+  return createSmsProvider({ ...env, ...overrides }, { fetchFn: mockFetch(sequence), now, logOrange: event => events.push(event) });
 }
 function assertNoSecrets(error) {
   assert.ok(error instanceof SmsProviderError);
@@ -26,7 +28,10 @@ function assertNoSecrets(error) {
 }
 
 test('OAuth puis envoi Orange au format officiel, sans senderName vide', async () => {
-  const provider = orange([token('test-token'), response(201, { outboundSMSMessageRequest: {} })]);
+  const resourceId = '12345678-1234-1234-1234-123456789abc';
+  const provider = orange([token('test-token'), response(201, { outboundSMSMessageRequest: {
+    resourceURL: `https://api.orange.com/smsmessaging/v1/outbound/tel:+2610000/requests/${resourceId}`,
+  } })]);
   await provider.sendOtp(message);
   assert.equal(calls.length, 2);
   assert.equal(calls[0].url, 'https://api.orange.com/oauth/v3/token');
@@ -36,17 +41,36 @@ test('OAuth puis envoi Orange au format officiel, sans senderName vide', async (
   assert.equal(calls[0].options.headers['Content-Type'], 'application/x-www-form-urlencoded');
   assert.ok(calls[0].options.signal);
   assert.equal(calls[1].url, 'https://api.orange.com/smsmessaging/v1/outbound/tel%3A%2B2610000/requests');
+  assert.doesNotMatch(calls[1].url, /SMS_OCB2|resource_type_parameter_management/);
   assert.equal(calls[1].options.headers.Authorization, 'Bearer test-token');
   assert.deepEqual(JSON.parse(calls[1].options.body), { outboundSMSMessageRequest: {
     address: 'tel:+261341234567', senderAddress: 'tel:+2610000',
     outboundSMSTextMessage: { message: 'Votre code MMS est 012345. Il expire dans 5 minutes.' },
   } });
+  assert.deepEqual(events, [{ timestamp_utc: '1970-01-01T00:00:00.000Z', sms_provider: 'orange',
+    recipient_masked: '+26134*****67', http_status: 201, resource_id: resourceId, result: 'accepted' }]);
+  assert.doesNotMatch(JSON.stringify(events), /012345|test-secret|test-token|test-id|261341234567/);
 });
 
 test('senderName optionnel est inclus seulement si non vide', async () => {
   const provider = orange([token('test-token'), response(201)], () => 0, { ORANGE_SENDER_NAME: 'MMS' });
   await provider.sendOtp(message);
   assert.equal(JSON.parse(calls[1].options.body).outboundSMSMessageRequest.senderName, 'MMS');
+});
+
+test('resource_id est aussi lu depuis Location, jamais depuis un identifiant ressemblant à un numéro', async () => {
+  const resourceId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const provider = orange([token('test-token'), new Response('{}', { status: 201, headers: {
+    Location: `https://api.orange.com/smsmessaging/v1/outbound/tel:+2610000/requests/${resourceId}`,
+  } })]);
+  await provider.sendOtp(message);
+  assert.equal(events[0].resource_id, resourceId);
+  const next = orange([token('test-token'), response(201, { outboundSMSMessageRequest: {
+    resourceURL: 'https://api.orange.com/smsmessaging/v1/outbound/tel:+2610000/requests/261341234567',
+  } })]);
+  await next.sendOtp(message);
+  assert.equal(events[0].resource_id, null);
+  assert.doesNotMatch(JSON.stringify(events), /261341234567|012345/);
 });
 
 test('token réutilisé et une seule requête OAuth pour des envois concurrents', async () => {
@@ -78,13 +102,20 @@ test('401 autre que Expired credentials ne retente pas', async () => {
   const provider = orange([token('test-token'), response(401, { code: 41, message: 'Invalid credentials' })]);
   await assert.rejects(provider.sendOtp(message), error => assertNoSecrets(error) && error.status === 401);
   assert.equal(calls.length, 2);
+  assert.deepEqual(events[0], { timestamp_utc: '1970-01-01T00:00:00.000Z', sms_provider: 'orange',
+    recipient_masked: '+26134*****67', http_status: 401, orange_error_code: '41', orange_error_message: 'Invalid credentials', result: 'failed' });
 });
 
-for (const status of [400, 500]) {
+for (const status of [400, 403, 500]) {
   test(`erreur Orange ${status} masquée et sans nouvel envoi`, async () => {
-    const provider = orange([token('test-token'), response(status, { message: 'Sensitive upstream detail' })]);
+    const provider = orange([token('test-token'), response(status, { code: status === 400 ? 22 : status === 403 ? 50 : 1,
+      message: 'Sensitive upstream detail test-secret 012345 +261341234567' })]);
     await assert.rejects(provider.sendOtp(message), error => assertNoSecrets(error) && error.phase === 'send' && error.status === status);
     assert.equal(calls.length, 2);
+    assert.equal(events[0].http_status, status);
+    assert.equal(events[0].result, 'failed');
+    assert.equal(events[0].orange_error_message, 'unavailable');
+    assert.doesNotMatch(JSON.stringify(events), /012345|test-secret|test-token|test-id|261341234567/);
   });
 }
 
@@ -92,6 +123,8 @@ test('réponse SMS perdue ou timeout : aucun retry aveugle', async () => {
   const provider = orange([token('test-token'), () => { throw new Error('network lost with secret test-secret'); }]);
   await assert.rejects(provider.sendOtp(message), error => assertNoSecrets(error) && error.phase === 'send');
   assert.equal(calls.length, 2);
+  assert.equal(events[0].http_status, null);
+  assert.equal(events[0].result, 'failed');
 });
 
 test('erreur OAuth masquée, sans tentative d’envoi', async () => {

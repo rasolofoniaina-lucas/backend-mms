@@ -3,7 +3,7 @@ import { readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
-import { parsePhoneNumberFromString } from 'libphonenumber-js';
+import { normalizeMalagasyPhone } from './phone.js';
 import { createSmsProvider, SmsProviderError } from './sms-provider.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
@@ -47,10 +47,9 @@ function limit(key: string, max: number, windowMs: number) {
 function clientIp(req: IncomingMessage) { return req.socket.remoteAddress || 'unknown'; } // Forwarded headers are intentionally not trusted.
 function normalizePhone(value: unknown) {
   const raw = textField(value, 'Numéro de téléphone', 6, 40);
-  const candidate = raw.startsWith('+') ? raw : `+261${raw.replace(/^0/, '')}`;
-  const phone = parsePhoneNumberFromString(candidate, 'MG');
-  if (!phone?.isValid() || phone.country !== 'MG') throw new HttpError(400, 'Entrez un numéro de téléphone malgache valide.');
-  return phone.number;
+  const phone = normalizeMalagasyPhone(raw);
+  if (!phone) throw new HttpError(400, 'Entrez un numéro de téléphone malgache valide.');
+  return phone;
 }
 function otpDigest(challengeId: string, code: string) { return createHmac('sha256', otpPepper).update(`${challengeId}:${code}`).digest('hex'); }
 function safeEqualHex(left: string, right: string) { const a = Buffer.from(left, 'hex'); const b = Buffer.from(right, 'hex'); return a.length === b.length && timingSafeEqual(a, b); }

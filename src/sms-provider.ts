@@ -15,7 +15,52 @@ type SmsDependencies = {
   now?: () => number;
   writeOtp?: typeof writeFile;
   log?: (message: string) => void;
+  logOrange?: (event: OrangeSmsLogEvent) => void;
 };
+
+export type OrangeSmsLogEvent = {
+  timestamp_utc: string;
+  sms_provider: 'orange';
+  recipient_masked: string;
+  http_status: number | null;
+  result: 'accepted' | 'failed';
+  resource_id?: string | null;
+  orange_error_code?: string | null;
+  orange_error_message?: string;
+};
+
+function maskedRecipient(phone: string): string {
+  return /^\+261\d{9}$/.test(phone) ? `${phone.slice(0, 6)}*****${phone.slice(-2)}` : 'invalid-recipient';
+}
+
+function orangeError(data: unknown): { code: string | null; message: string } {
+  const detail = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+  const code = String(detail.code ?? '');
+  const knownMessages = new Set([
+    'Expired credentials', 'Invalid credentials', 'Missing credentials', 'Invalid URL parameter value',
+    'Missing body', 'Invalid body', 'Missing body field', 'Invalid body field', 'Missing header',
+    'Invalid header value', 'Access denied', 'Forbidden requester', 'Forbidden user',
+    'Too many requests', 'Not enough credit', 'Internal error', 'Bad gateway',
+  ]);
+  return {
+    code: /^\d{1,3}$/.test(code) ? code : null,
+    // Orange may include user data in arbitrary messages: log only known fixed phrases.
+    message: typeof detail.message === 'string' && knownMessages.has(detail.message) ? detail.message : 'unavailable',
+  };
+}
+
+function orangeResourceId(data: unknown, location: string | null): string | null {
+  const message = data && typeof data === 'object' ? (data as Record<string, unknown>).outboundSMSMessageRequest : undefined;
+  const resourceUrl = message && typeof message === 'object' ? (message as Record<string, unknown>).resourceURL : undefined;
+  for (const candidate of [resourceUrl, location]) {
+    if (typeof candidate !== 'string') continue;
+    try {
+      const id = new URL(candidate).pathname.split('/').filter(Boolean).at(-1);
+      if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return id;
+    } catch { /* Ignore malformed upstream URLs. */ }
+  }
+  return null;
+}
 
 class ConsoleSmsProvider implements SmsProvider {
   constructor(private readonly writeOtp: typeof writeFile, private readonly log: (message: string) => void) {}
@@ -39,8 +84,13 @@ class OrangeSmsProvider implements SmsProvider {
     private readonly senderName: string,
     private readonly fetchFn: typeof fetch,
     private readonly now: () => number,
+    private readonly logOrange: (event: OrangeSmsLogEvent) => void,
   ) {
     this.smsUrl = `https://api.orange.com/smsmessaging/v1/outbound/${encodeURIComponent(sender)}/requests`;
+  }
+
+  private emit(event: OrangeSmsLogEvent): void {
+    try { this.logOrange(event); } catch { /* Observability must not change SMS delivery. */ }
   }
 
   private async token(): Promise<string> {
@@ -89,32 +139,46 @@ class OrangeSmsProvider implements SmsProvider {
       },
     };
     const body = JSON.stringify(payload);
-    let token = await this.token();
-    for (let attempt = 0; attempt < 2; attempt++) {
-      let response: Response;
-      try {
-        response = await this.fetchFn(this.smsUrl, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' },
-          body,
-          signal: AbortSignal.timeout(8000),
-          redirect: 'error',
-        });
-      } catch {
-        // A lost response may follow a successful send. Never retry an ambiguous delivery.
-        throw new SmsProviderError('send');
-      }
-      if (response.ok) return;
-      if (response.status === 401 && attempt === 0) {
-        const error: unknown = await response.json().catch(() => undefined);
-        const detail = error && typeof error === 'object' ? error as Record<string, unknown> : {};
-        if (detail.code === 42 || detail.code === '42' || detail.message === 'Expired credentials') {
+    const baseEvent = { timestamp_utc: new Date(this.now()).toISOString(), sms_provider: 'orange' as const, recipient_masked: maskedRecipient(phone) };
+    let errorCode: string | null = null;
+    let errorMessage = 'unavailable';
+    try {
+      let token = await this.token();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let response: Response;
+        try {
+          response = await this.fetchFn(this.smsUrl, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+            body,
+            signal: AbortSignal.timeout(8000),
+            redirect: 'error',
+          });
+        } catch {
+          // A lost response may follow a successful send. Never retry an ambiguous delivery.
+          throw new SmsProviderError('send');
+        }
+        if (response.ok) {
+          const data: unknown = await response.json().catch(() => undefined);
+          this.emit({ ...baseEvent, http_status: response.status, resource_id: orangeResourceId(data, response.headers.get('location')), result: 'accepted' });
+          return;
+        }
+        const data: unknown = await response.json().catch(() => undefined);
+        const detail = orangeError(data);
+        errorCode = detail.code;
+        errorMessage = detail.message;
+        if (response.status === 401 && attempt === 0 && (detail.code === '42' || detail.message === 'Expired credentials')) {
           if (this.cachedToken?.value === token) this.cachedToken = undefined;
           token = await this.token();
           continue; // The explicit expired-credentials response means Orange rejected the send.
         }
+        throw new SmsProviderError('send', response.status);
       }
-      throw new SmsProviderError('send', response.status);
+    } catch (error) {
+      const failure = error instanceof SmsProviderError ? error : new SmsProviderError('send');
+      this.emit({ ...baseEvent, http_status: failure.status ?? null, orange_error_code: errorCode,
+        orange_error_message: failure.phase === 'oauth' ? 'OAuth unavailable' : errorMessage, result: 'failed' });
+      throw failure;
     }
   }
 }
@@ -133,5 +197,6 @@ export function createSmsProvider(env: SmsEnvironment, dependencies: SmsDependen
   if (!/^tel:\+261\d{4,12}$/.test(sender)) throw new Error('ORANGE_COUNTRY_SENDER doit être un numéro sender malgache au format tel:+261...');
   const senderName = env.ORANGE_SENDER_NAME?.trim() || '';
   if (senderName && !/^[a-zA-Z0-9 ]{1,11}$/.test(senderName)) throw new Error('ORANGE_SENDER_NAME doit contenir au plus 11 caractères alphanumériques ou espaces.');
-  return new OrangeSmsProvider(clientId, clientSecret, sender, senderName, dependencies.fetchFn || fetch, dependencies.now || Date.now);
+  return new OrangeSmsProvider(clientId, clientSecret, sender, senderName, dependencies.fetchFn || fetch, dependencies.now || Date.now,
+    dependencies.logOrange || (event => console.info(JSON.stringify(event))));
 }

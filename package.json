@@ -6,7 +6,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
-    "test:unit": "node --import tsx --test test/sms-provider.test.mjs",
+    "test:unit": "node --import tsx --test test/sms-provider.test.mjs test/phone-normalization.test.mjs",
     "test:integration": "node --test test/auth.integration.test.mjs"
   },
   "dependencies": {
