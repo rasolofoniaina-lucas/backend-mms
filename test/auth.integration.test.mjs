@@ -23,7 +23,10 @@ function testOtp(challengeId) {
   assert.match(container, /^[a-zA-Z0-9_.-]+$/);
   const command = ['exec', container, 'cat', `/tmp/mms-test-otp-${challengeId}`];
   const host = process.env.MMS_OTP_SSH_HOST;
-  return execFileSync(host ? 'ssh' : 'docker', host ? ['-o', 'BatchMode=yes', host, `docker ${command.join(' ')}`] : command, { encoding: 'utf8' }).trim();
+  return execFileSync(host ? 'ssh' : 'docker', host ? [
+    '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2',
+    host, `docker ${command.join(' ')}`,
+  ] : command, { encoding: 'utf8', timeout: 20_000 }).trim();
 }
 async function register(phone, firstName) {
   const requested = await api('/auth/register/request-otp', { method: 'POST', body: { firstName, lastName: 'Recette', phone, termsAccepted: true, privacyAccepted: true } });
