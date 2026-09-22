@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { canTransition, hashPassword, staffEmail, temporaryPassword, validPassword, verifyPassword } from '../src/staff-domain.ts';
+import { canTransition, hashPassword, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword } from '../src/staff-domain.ts';
 
-test('email staff normalisé et domaine strict', () => {
+test('username staff et email facultatif normalisés', () => {
+  assert.equal(staffUsername(' JRakoto '), 'jrakoto');
+  assert.equal(staffUsername('2rakoto'), null);
+  assert.equal(staffUsername('ab'), null);
+  assert.equal(staffUsername('jean rakoto'), null);
   assert.equal(staffEmail(' Jean.Rakoto@MMS.MG '), 'jean.rakoto@mms.mg');
-  assert.equal(staffEmail('jean@example.com'), null);
-  assert.equal(staffEmail('jean..rakoto@mms.mg'), null);
+  assert.equal(staffEmail('jean@example.com'), 'jean@example.com');
+  assert.equal(staffEmail(''), null);
+  assert.equal(staffEmail('invalid'), null);
 });
 test('mot de passe Argon2id et temporaire non récupérable', async () => {
   const password = temporaryPassword();

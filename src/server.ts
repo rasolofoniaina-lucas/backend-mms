@@ -7,7 +7,7 @@ import { isIP } from 'node:net';
 import { Pool } from 'pg';
 import { normalizeMalagasyPhone } from './phone.js';
 import { createSmsProvider, SmsProviderError } from './sms-provider.js';
-import { canTransition, hashPassword, isStaffRole, staffEmail, temporaryPassword, validPassword, verifyPassword, type Role, type TicketStatus } from './staff-domain.js';
+import { canTransition, hashPassword, isStaffRole, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword, type Role, type TicketStatus } from './staff-domain.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
 if (!process.env.OTP_PEPPER || !process.env.ACCESS_TOKEN_SECRET) throw new Error('OTP_PEPPER et ACCESS_TOKEN_SECRET sont requis.');
@@ -82,8 +82,8 @@ async function identity(req: IncomingMessage, allowed: readonly Role[] = ['custo
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) throw new HttpError(401, 'Connexion requise.');
   const auth = verifyAccessToken(header.slice(7));
-  const active = await pool.query(`SELECT u.role,u.must_change_password,c.id AS customer_id FROM user_sessions s
-    JOIN users u ON u.id=s.user_id LEFT JOIN customers c ON c.user_id=u.id
+  const active = await pool.query(`SELECT u.role,COALESCE(lc.must_change_password,false) AS must_change_password,c.id AS customer_id FROM user_sessions s
+    JOIN users u ON u.id=s.user_id LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id
     WHERE s.id=$1 AND s.user_id=$2 AND s.revoked_at IS NULL AND s.expires_at>now() AND u.status='active'`,
   [auth.sessionId, auth.userId]);
   if (!active.rowCount || active.rows[0].role !== auth.role || (auth.role === 'customer' && active.rows[0].customer_id !== auth.customerId)) throw new HttpError(401, 'Session expirée.');
@@ -240,7 +240,8 @@ async function issueSession(userId: string, customerId: string, req: IncomingMes
   await pool.query(`INSERT INTO user_sessions (id,user_id,refresh_token_hash,user_agent,device_label,expires_at) VALUES ($1,$2,$3,$4,$5,$6)`, [sessionId, userId, hash, agent, label, expires]);
   res.setHeader('Set-Cookie', refreshCookie(refresh, expires));
   if (role === 'customer') return { accessToken: accessToken({ userId, customerId, sessionId, role }), user: await customerData(customerId) };
-  const user = await pool.query('SELECT id,first_name AS "firstName",last_name AS "lastName",email,role,must_change_password AS "mustChangePassword" FROM users WHERE id=$1', [userId]);
+  const user = await pool.query(`SELECT u.id,u.username,u.first_name AS "firstName",u.last_name AS "lastName",u.email,u.role,
+    lc.must_change_password AS "mustChangePassword" FROM users u JOIN local_credentials lc ON lc.user_id=u.id WHERE u.id=$1`, [userId]);
   return { accessToken: accessToken({ userId, customerId: '', sessionId, role }), user: user.rows[0] };
 }
 async function createChallenge(req: IncomingMessage, input: Record<string, unknown>, purpose: 'register' | 'login' | 'phone_change', userId?: string) {
@@ -312,32 +313,37 @@ async function verifyChallenge(req: IncomingMessage, input: Record<string, unkno
 async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: string[], method: string, path: URL) {
   if (method === 'POST' && parts[2] === 'login' && parts.length === 3) {
     const input = await body(req);
-    const email = staffEmail(input.email);
+    const username = staffUsername(input.username);
     const password = typeof input.password === 'string' ? input.password : '';
     limit(`staff-login-ip:${clientIp(req)}`, 30, 15 * 60_000);
-    limit(`staff-login-email:${email || 'invalid'}`, 8, 15 * 60_000);
-    const generic = new HttpError(401, 'Email ou mot de passe incorrect.');
-    if (!email || !password) throw generic;
-    const found = await pool.query(`SELECT id,role,password_hash FROM users WHERE email=$1 AND status='active'`, [email]);
+    limit(`staff-login-username:${username || 'invalid'}`, 8, 15 * 60_000);
+    const generic = new HttpError(401, 'Identifiant ou mot de passe incorrect.');
+    if (!username || !password) throw generic;
+    const found = await pool.query(`SELECT u.id,u.role,lc.password_hash FROM users u
+      JOIN user_identities ui ON ui.user_id=u.id AND ui.provider='local'
+      JOIN local_credentials lc ON lc.user_id=u.id
+      WHERE lower(ui.provider_subject)=lower($1) AND lower(u.username)=lower($1) AND u.status='active'`, [username]);
     if (!found.rowCount || !isStaffRole(found.rows[0].role) || !found.rows[0].password_hash || !await verifyPassword(found.rows[0].password_hash, password)) throw generic;
     return send(res, 200, await issueSession(found.rows[0].id, '', req, res, found.rows[0].role));
   }
   const auth = await requireRole(req, allStaffRoles, ['me','change-password','logout-all'].includes(parts[2]));
   if (method === 'GET' && parts[2] === 'me' && parts.length === 3) {
-    const found = await pool.query('SELECT id,first_name AS "firstName",last_name AS "lastName",email,role,must_change_password AS "mustChangePassword" FROM users WHERE id=$1', [auth.userId]);
+    const found = await pool.query(`SELECT u.id,u.username,u.first_name AS "firstName",u.last_name AS "lastName",u.email,u.role,
+      lc.must_change_password AS "mustChangePassword" FROM users u JOIN local_credentials lc ON lc.user_id=u.id WHERE u.id=$1`, [auth.userId]);
     return send(res, 200, found.rows[0]);
   }
   if (method === 'POST' && parts[2] === 'change-password' && parts.length === 3) {
     limit(`staff-password:${auth.userId}`, 8, 15 * 60_000);
     const input = await body(req);
     if (!validPassword(input.newPassword) || input.newPassword === input.currentPassword) throw new HttpError(400, 'Le nouveau mot de passe doit contenir au moins 12 caractères et différer de l’ancien.');
-    const found = await pool.query('SELECT password_hash FROM users WHERE id=$1', [auth.userId]);
+    const found = await pool.query('SELECT password_hash FROM local_credentials WHERE user_id=$1', [auth.userId]);
     if (!found.rowCount || !await verifyPassword(found.rows[0].password_hash, String(input.currentPassword || ''))) throw new HttpError(401, 'Mot de passe actuel incorrect.');
     const digest = await hashPassword(input.newPassword);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('UPDATE users SET password_hash=$2,must_change_password=false,updated_at=now() WHERE id=$1', [auth.userId, digest]);
+      await client.query('UPDATE local_credentials SET password_hash=$2,must_change_password=false,password_changed_at=now() WHERE user_id=$1', [auth.userId, digest]);
+      await client.query('UPDATE users SET updated_at=now() WHERE id=$1', [auth.userId]);
       await client.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1', [auth.userId]);
       await client.query('COMMIT');
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
@@ -459,12 +465,12 @@ async function adminRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       values.push(role); filters.push(`u.role=$${values.length}`);
     }
     const q = path.searchParams.get('q');
-    if (q) { values.push(`%${textField(q,'Recherche',1,80)}%`); filters.push(`(u.email ILIKE $${values.length} OR u.phone_e164 ILIKE $${values.length} OR u.first_name ILIKE $${values.length} OR u.last_name ILIKE $${values.length} OR c.name ILIKE $${values.length})`); }
-    const rows = await pool.query(`SELECT u.id,u.role,u.status,u.email,u.phone_e164 AS phone,
+    if (q) { values.push(`%${textField(q,'Recherche',1,80)}%`); filters.push(`(u.username ILIKE $${values.length} OR u.email ILIKE $${values.length} OR u.phone_e164 ILIKE $${values.length} OR u.first_name ILIKE $${values.length} OR u.last_name ILIKE $${values.length} OR c.name ILIKE $${values.length})`); }
+    const rows = await pool.query(`SELECT u.id,u.role,u.status,u.username,u.email,u.phone_e164 AS phone,
       COALESCE(u.first_name,c.first_name) AS "firstName",COALESCE(u.last_name,c.last_name) AS "lastName",
-      u.phone_verified_at AS "phoneVerifiedAt",u.must_change_password AS "mustChangePassword",u.created_at AS "createdAt",
+      u.phone_verified_at AS "phoneVerifiedAt",COALESCE(lc.must_change_password,false) AS "mustChangePassword",u.created_at AS "createdAt",
       (SELECT max(s.last_seen_at) FROM user_sessions s WHERE s.user_id=u.id) AS "lastActivity"
-      FROM users u LEFT JOIN customers c ON c.user_id=u.id ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+      FROM users u LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
       ORDER BY u.created_at DESC LIMIT 200`, values);
     return send(res, 200, rows.rows);
   }
@@ -477,21 +483,27 @@ async function adminRoute(req: IncomingMessage, res: ServerResponse, parts: stri
     const lastName = textField(input.lastName, 'Nom', 1, 80);
     const isCustomer = role === 'customer';
     const phone = isCustomer ? normalizePhone(input.phone) : null;
+    const username = isCustomer ? null : staffUsername(input.username);
     const email = isCustomer ? null : staffEmail(input.email);
-    if (!isCustomer && !email) throw new HttpError(400, 'Email @mms.mg invalide.');
+    if (!isCustomer && !username) throw new HttpError(400, 'Username invalide : 3 à 32 caractères, commençant par une lettre, puis lettres, chiffres, point, tiret ou underscore.');
+    if (!isCustomer && typeof input.email === 'string' && input.email.trim() && !email) throw new HttpError(400, 'Email invalide.');
     const temporary = isCustomer ? null : temporaryPassword();
     const digest = temporary ? await hashPassword(temporary) : null;
     const userId = randomUUID(); const customerId = isCustomer ? randomUUID() : null;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(`INSERT INTO users(id,role,phone_e164,email,first_name,last_name,password_hash,must_change_password)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [userId, role, phone, email, firstName, lastName, digest, !isCustomer]);
+      await client.query(`INSERT INTO users(id,role,phone_e164,username,email,first_name,last_name)
+        VALUES($1,$2,$3,$4,$5,$6,$7)`, [userId, role, phone, username, email, firstName, lastName]);
       if (isCustomer) await client.query(`INSERT INTO customers(id,user_id,name,phone,first_name,last_name)
         VALUES($1,$2,$3,$4,$5,$6)`, [customerId, userId, `${firstName} ${lastName}`, phone, firstName, lastName]);
+      else {
+        await client.query(`INSERT INTO user_identities(id,user_id,provider,provider_subject) VALUES($1,$2,'local',$3)`, [randomUUID(), userId, username]);
+        await client.query(`INSERT INTO local_credentials(user_id,password_hash,must_change_password) VALUES($1,$2,true)`, [userId, digest]);
+      }
       await client.query(`INSERT INTO admin_audit_events(actor_user_id,target_user_id,action) VALUES($1,$2,'admin_created_user')`, [auth.userId, userId]);
       await client.query('COMMIT');
-      return send(res, 201, { id: userId, role, email, phone, temporaryPassword: temporary, phoneVerified: false });
+      return send(res, 201, { id: userId, role, username, email, phone, temporaryPassword: temporary, phoneVerified: false });
     } catch (error) {
       await client.query('ROLLBACK');
       if ((error as { code?: string }).code === '23505') throw new HttpError(409, 'Cette identité est déjà utilisée.');
@@ -528,7 +540,8 @@ async function adminRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       await client.query('BEGIN');
       const target = await client.query('SELECT role FROM users WHERE id=$1 FOR UPDATE', [targetId]);
       if (!target.rowCount || !isStaffRole(target.rows[0].role)) throw new HttpError(404, 'Compte staff introuvable.');
-      await client.query('UPDATE users SET password_hash=$2,must_change_password=true,updated_at=now() WHERE id=$1', [targetId, digest]);
+      await client.query(`UPDATE local_credentials SET password_hash=$2,must_change_password=true,password_changed_at=NULL WHERE user_id=$1`, [targetId, digest]);
+      await client.query('UPDATE users SET updated_at=now() WHERE id=$1', [targetId]);
       await client.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1', [targetId]);
       await client.query(`INSERT INTO admin_audit_events(actor_user_id,target_user_id,action) VALUES($1,$2,'admin_reset_password')`, [auth.userId, targetId]);
       await client.query('COMMIT'); return send(res, 200, { temporaryPassword: temporary });
@@ -580,9 +593,9 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       limit(`refresh:${clientIp(req)}`, 30, 15 * 60_000); const token = cookie(req, 'mms_refresh'); if (!token) throw new HttpError(401, 'Session expirée.');
       const hash = createHmac('sha256', accessSecret).update(token).digest('hex');
       const found = await pool.query(`UPDATE user_sessions s SET revoked_at=now() FROM users u
-        LEFT JOIN customers c ON c.user_id=u.id WHERE s.user_id=u.id AND s.refresh_token_hash=$1
+        LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id WHERE s.user_id=u.id AND s.refresh_token_hash=$1
         AND s.revoked_at IS NULL AND s.expires_at>now() AND u.status='active'
-        RETURNING s.user_id,u.role,u.must_change_password,c.id AS customer_id`, [hash]);
+        RETURNING s.user_id,u.role,COALESCE(lc.must_change_password,false) AS must_change_password,c.id AS customer_id`, [hash]);
       if (!found.rowCount) throw new HttpError(401, 'Session expirée.');
       return send(res, 200, await issueSession(found.rows[0].user_id, found.rows[0].customer_id || '', req, res, found.rows[0].role));
     }

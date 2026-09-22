@@ -19,10 +19,16 @@ export function hashPassword(value: string): Promise<string> {
 export function verifyPassword(digest: string, value: string): Promise<boolean> {
   return verify(digest, value).catch(() => false);
 }
+export function staffUsername(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const username = value.trim().toLowerCase();
+  return /^[a-z][a-z0-9._-]{2,31}$/.test(username) ? username : null;
+}
 export function staffEmail(value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string') return null;
   const email = value.trim().toLowerCase();
-  return /^[a-z][a-z0-9-]{0,30}\.[a-z][a-z0-9-]{0,30}@mms\.mg$/.test(email) ? email : null;
+  return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
 }
 export function isStaffRole(value: unknown): value is StaffRole {
   return staffRoles.includes(value as StaffRole);

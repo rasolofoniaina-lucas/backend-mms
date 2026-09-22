@@ -18,23 +18,66 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS users_active_phone_unique ON users(phone_e164) WHERE status = 'active';
 
--- Phase A: staff identities share the existing users/session infrastructure.
+-- Staff business identities share users/session infrastructure, while login
+-- identities and credentials live in dedicated tables for future providers.
 ALTER TABLE users ALTER COLUMN phone_e164 DROP NOT NULL;
 ALTER TABLE users ALTER COLUMN phone_verified_at DROP NOT NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password boolean NOT NULL DEFAULT false;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
 ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('customer', 'mechanic', 'workshop_manager', 'admin'));
+-- Phase A installations had staff passwords on users. Give those development
+-- identities a stable collision-free username before tightening constraints.
+UPDATE users SET username='legacy_' || substr(replace(id::text,'-',''),1,12)
+WHERE role IN ('mechanic','workshop_manager','admin') AND username IS NULL;
+UPDATE users SET username=lower(trim(username)),email=lower(trim(email))
+WHERE role IN ('mechanic','workshop_manager','admin');
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique ON users (lower(username)) WHERE username IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (lower(email)) WHERE email IS NOT NULL;
 CREATE INDEX IF NOT EXISTS users_role_status_idx ON users(role, status);
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_identity_shape_check;
 ALTER TABLE users ADD CONSTRAINT users_identity_shape_check CHECK (
-  (role='customer' AND phone_e164 IS NOT NULL AND email IS NULL AND password_hash IS NULL)
-  OR (role IN ('mechanic','workshop_manager','admin') AND phone_e164 IS NULL AND email IS NOT NULL AND password_hash IS NOT NULL)
+  (role='customer' AND phone_e164 IS NOT NULL AND username IS NULL AND email IS NULL)
+  OR (role IN ('mechanic','workshop_manager','admin') AND phone_e164 IS NULL
+      AND username IS NOT NULL AND username ~ '^[a-z][a-z0-9._-]{2,31}$')
 );
+
+CREATE TABLE IF NOT EXISTS user_identities (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider text NOT NULL CHECK (provider IN ('local','ldap','active_directory','oidc')),
+  provider_subject text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(user_id,provider)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS user_identities_provider_subject_unique
+  ON user_identities(provider,lower(provider_subject));
+
+CREATE TABLE IF NOT EXISTS local_credentials (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  password_hash text NOT NULL,
+  must_change_password boolean NOT NULL DEFAULT true,
+  password_changed_at timestamptz
+);
+
+-- Idempotent Phase A data migration. No business FK changes: user.id remains canonical.
+INSERT INTO user_identities(id,user_id,provider,provider_subject)
+SELECT gen_random_uuid(),id,'local',username FROM users
+WHERE role IN ('mechanic','workshop_manager','admin')
+ON CONFLICT (user_id,provider) DO NOTHING;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='password_hash') THEN
+    INSERT INTO local_credentials(user_id,password_hash,must_change_password,password_changed_at)
+    SELECT id,password_hash,must_change_password,
+      CASE WHEN must_change_password THEN NULL ELSE updated_at END
+    FROM users WHERE role IN ('mechanic','workshop_manager','admin') AND password_hash IS NOT NULL
+    ON CONFLICT (user_id) DO NOTHING;
+  END IF;
+END $$;
+ALTER TABLE users DROP COLUMN IF EXISTS password_hash;
+ALTER TABLE users DROP COLUMN IF EXISTS must_change_password;
 
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS first_name text;

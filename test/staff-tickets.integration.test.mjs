@@ -9,10 +9,10 @@ const suffix = randomInt(10000, 90000);
 const phone = `+2613413${suffix}`;
 const customerAdminPhone = `+2613413${suffix + 1}`;
 const identity = randomUUID().slice(0, 8);
-const adminEmail = `recette.${identity}@mms.mg`;
-const managerEmail = `chef.${identity}@mms.mg`;
-const mechanicAEmail = `meca.${identity}@mms.mg`;
-const mechanicBEmail = `atelier.${identity}@mms.mg`;
+const adminUsername = `admin_${identity}`;
+const managerUsername = `chef_${identity}`;
+const mechanicAUsername = `meca_${identity}`;
+const mechanicBUsername = `atelier_${identity}`;
 
 async function api(path, { method = 'GET', body, token, cookie } = {}) {
   const response = await fetch(`${base}/api${path}`, { method, headers: {
@@ -27,15 +27,15 @@ function otp(challengeId) {
   return execFileSync('docker', ['exec', container, 'cat', `/tmp/mms-test-otp-${challengeId}`], { encoding: 'utf8' }).trim();
 }
 function bootstrap() {
-  const output = execFileSync('docker', ['compose','exec','-T','api','npm','run','admin:create'], {
-    input: `Recette\nAdmin\n${adminEmail}\n`, encoding: 'utf8', cwd: new URL('../..', import.meta.url),
+  const output = execFileSync('docker', ['exec','-i',container,'npm','run','admin:create'], {
+    input: `Recette\nAdmin\n${adminUsername}\n\n`, encoding: 'utf8',
   });
   const password = output.match(/Mot de passe temporaire \(affiché une seule fois\) : ([A-Za-z0-9]+)/)?.[1];
   assert.ok(password, 'Le bootstrap doit remettre un mot de passe temporaire une seule fois');
   return password;
 }
-async function activate(email, temporary) {
-  const first = await api('/staff/login', { method: 'POST', body: { email, password: temporary } });
+async function activate(username, temporary) {
+  const first = await api('/staff/login', { method: 'POST', body: { username, password: temporary } });
   assert.equal(first.status, 200);
   assert.equal(first.data.user.mustChangePassword, true);
   assert.equal((await api('/staff/tickets', { token: first.data.accessToken })).status, 403);
@@ -43,8 +43,8 @@ async function activate(email, temporary) {
   const changed = await api('/staff/change-password', { method: 'POST', token: first.data.accessToken, body: { currentPassword: temporary, newPassword: permanent } });
   assert.equal(changed.status, 200);
   assert.equal((await api('/staff/me', { token: first.data.accessToken })).status, 401);
-  assert.equal((await api('/staff/login', { method: 'POST', body: { email, password: temporary } })).status, 401);
-  const login = await api('/staff/login', { method: 'POST', body: { email, password: permanent } });
+  assert.equal((await api('/staff/login', { method: 'POST', body: { username, password: temporary } })).status, 401);
+  const login = await api('/staff/login', { method: 'POST', body: { username: username.toUpperCase(), password: permanent } });
   assert.equal(login.status, 200);
   assert.equal(login.data.user.mustChangePassword, false);
   return { ...login, permanent };
@@ -52,7 +52,7 @@ async function activate(email, temporary) {
 
 test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
   const bootstrapPassword = bootstrap();
-  const admin = await activate(adminEmail, bootstrapPassword);
+  const admin = await activate(adminUsername, bootstrapPassword);
   await t.test('bootstrap admin et changement obligatoire', async () => {
     assert.equal(admin.data.user.role, 'admin');
     assert.equal((await api('/admin/users', { token: admin.data.accessToken })).status, 200);
@@ -62,18 +62,22 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
     assert.equal(refreshed.data.user.role, 'admin');
     admin.data.accessToken = refreshed.data.accessToken;
   });
-  async function createStaff(email, role) {
-    const result = await api('/admin/users', { method: 'POST', token: admin.data.accessToken, body: { firstName: 'Recette', lastName: role, email, role } });
+  async function createStaff(username, role, email = '') {
+    const result = await api('/admin/users', { method: 'POST', token: admin.data.accessToken, body: { firstName: 'Recette', lastName: role, username, email, role } });
     assert.equal(result.status, 201);
     assert.ok(result.data.temporaryPassword);
     return result.data;
   }
-  const chefCreated = await createStaff(managerEmail, 'workshop_manager');
-  const aCreated = await createStaff(mechanicAEmail, 'mechanic');
-  const bCreated = await createStaff(mechanicBEmail, 'mechanic');
-  const chef = await activate(managerEmail, chefCreated.temporaryPassword);
-  const mecaA = await activate(mechanicAEmail, aCreated.temporaryPassword);
-  const mecaB = await activate(mechanicBEmail, bCreated.temporaryPassword);
+  const chefCreated = await createStaff(managerUsername, 'workshop_manager');
+  const aCreated = await createStaff(mechanicAUsername, 'mechanic');
+  const bCreated = await createStaff(mechanicBUsername, 'mechanic', `atelier.${identity}@mms.mg`);
+  assert.equal(aCreated.email, null);
+  assert.equal((await api('/admin/users', { method: 'POST', token: admin.data.accessToken, body: { firstName: 'Doublon', lastName: 'Recette', username: mechanicAUsername.toUpperCase(), role: 'mechanic' } })).status, 409);
+  assert.equal((await api('/staff/login', { method: 'POST', body: { username: `absent_${identity}`, password: 'wrong-password' } })).status, 401);
+  assert.equal((await api('/staff/login', { method: 'POST', body: { username: mechanicAUsername, password: 'wrong-password' } })).status, 401);
+  const chef = await activate(managerUsername, chefCreated.temporaryPassword);
+  const mecaA = await activate(mechanicAUsername, aCreated.temporaryPassword);
+  const mecaB = await activate(mechanicBUsername, bCreated.temporaryPassword);
   await t.test('rôles staff et frontières admin', async () => {
     assert.equal((await api('/admin/users', { token: chef.data.accessToken })).status, 403);
     assert.equal((await api('/admin/users', { token: mecaA.data.accessToken })).status, 403);
@@ -131,12 +135,12 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
     assert.equal(listed.data.find(row => row.id === manual.data.id).phoneVerifiedAt, null);
     assert.equal((await api(`/admin/users/${bCreated.id}/status`, { method: 'PATCH', token: admin.data.accessToken, body: { status: 'disabled' } })).status, 200);
     assert.equal((await api('/staff/me', { token: mecaB.data.accessToken })).status, 401);
-    assert.equal((await api('/staff/login', { method: 'POST', body: { email: mechanicBEmail, password: mecaB.permanent } })).status, 401);
+    assert.equal((await api('/staff/login', { method: 'POST', body: { username: mechanicBUsername, password: mecaB.permanent } })).status, 401);
     assert.equal((await api(`/admin/users/${bCreated.id}/status`, { method: 'PATCH', token: admin.data.accessToken, body: { status: 'active' } })).status, 200);
     const reset = await api(`/admin/users/${aCreated.id}/reset-password`, { method: 'POST', token: admin.data.accessToken, body: {} });
     assert.equal(reset.status, 200); assert.ok(reset.data.temporaryPassword);
     assert.equal((await api('/staff/me', { token: mecaA.data.accessToken })).status, 401);
-    assert.equal((await api('/staff/login', { method: 'POST', body: { email: mechanicAEmail, password: mecaA.permanent } })).status, 401);
+    assert.equal((await api('/staff/login', { method: 'POST', body: { username: mechanicAUsername, password: mecaA.permanent } })).status, 401);
   });
-  t.diagnostic(`RECETTE_LOCALE comptes=${adminEmail},${managerEmail},${mechanicAEmail},${mechanicBEmail},${phone},${customerAdminPhone} ticket=${ticket.reference} moto=${vehicle.data.id} rendez_vous=${appointment.data.id}`);
+  t.diagnostic(`RECETTE_LOCALE usernames=${adminUsername},${managerUsername},${mechanicAUsername},${mechanicBUsername} clients=${phone},${customerAdminPhone} ticket=${ticket.reference} moto=${vehicle.data.id} rendez_vous=${appointment.data.id}`);
 });
