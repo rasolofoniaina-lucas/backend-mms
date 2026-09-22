@@ -1,22 +1,18 @@
 # MMS backend
 
-API Node.js/TypeScript et base PostgreSQL pour la V1 de test moto. Ce dossier possède son propre dépôt Git.
+API Node.js/TypeScript et PostgreSQL du service de mécanique moto. Ce dossier possède son propre dépôt Git. Depuis la racine MMS, lancer `docker compose up -d --build api` et vérifier `docker compose ps`.
 
-Lancement recommandé depuis la racine MMS :
+## Authentification et SMS
 
-```sh
-docker compose up --build -d
-docker compose ps
-```
+Les clients s'inscrivent ou se connectent avec un numéro malgache et un OTP à six chiffres. La demande, la vérification, le changement de numéro et la gestion des sessions sont décrits dans [`../AUTHENTICATION.md`](../AUTHENTICATION.md).
 
-L'API est disponible sur <http://localhost:8080/api/health> via Nginx, et sur `127.0.0.1:3000` pour le développement. Le schéma `src/schema.sql` est appliqué au démarrage. Les données PostgreSQL sont dans un volume Compose persistant.
+Le choix du transport est fait au démarrage :
 
-Routes principales : `POST /api/customers`, `GET/PATCH /api/customers/:id`, `POST /api/customers/:id/phone-change`, `POST /api/customers/:id/phone-change/confirm`, `POST /api/customers/:id/vehicles`, `POST /api/customers/:id/appointments`, `PATCH /api/customers/:id/appointments/:id/cancel`, `GET /api/availability`, `GET /api/mechanic/appointments`, `PATCH /api/mechanic/appointments/:id`.
+- `SMS_PROVIDER=console` exige `MMS_TEST_MODE=1`. Le code est écrit uniquement dans `/tmp/mms-test-otp-<challengeId>` du conteneur API, jamais dans la réponse HTTP ni les logs. Ce fichier est effacé après validation.
+- `SMS_PROVIDER=orange` exige `ORANGE_CLIENT_ID` et `ORANGE_CLIENT_SECRET`. Le backend obtient un token OAuth `client_credentials` chez Orange, le garde en mémoire, et envoie l'OTP via SMS Messaging v1. Les codes, secrets et tokens ne sont pas loggés. En cas d'échec, l'API retourne un message générique et annule la création du challenge.
 
-Les motos acceptent aussi `PATCH /api/customers/:id/vehicles/:vehicleId` (modifier la fiche) et `GET/PUT/DELETE /api/customers/:id/vehicles/:vehicleId/photo`. À la création ou modification, `name` (marque), `displacementCc` (entier 1–5000) et `year` (1885 à l'année prochaine) sont requis ; `model` et `plate` peuvent être vides. L'envoi photo utilise le corps binaire avec `Content-Type: image/jpeg`, `image/png` ou `image/webp`, vérifie la signature du fichier et limite sa taille à 5 Mo. Les octets sont stockés dans PostgreSQL. Les anciennes motos sans les nouveaux champs restent lisibles et peuvent être mises à jour.
+`ORANGE_COUNTRY_SENDER` vaut `tel:+2610000` par défaut. `ORANGE_SENDER_NAME` est facultatif : il doit être approuvé par Orange et ne peut contenir que 11 caractères alphanumériques ou espaces au maximum. Les identifiants réels restent dans le `.env` privé, jamais dans Git. Un abonnement Orange SMS Madagascar actif avec du crédit est requis ; aucun envoi réel n'est effectué par les tests automatisés.
 
-Le numéro ne se modifie pas par `PATCH /customers/:id` : il faut d'abord demander un changement, puis confirmer son challenge. En mode test, le serveur renvoie le code fixe `000000` dans la réponse de demande ; il expire après 10 minutes et autorise cinq essais. Aucun SMS n'est envoyé. L'inscription ne demande pas encore d'OTP.
+## Vérifications
 
-La base bloque les doubles réservations actives pour un même type d'intervention, jour et créneau. Le dépannage n'a pas de créneau. Les statuts et notes enregistrés par le mécanicien sont visibles côté client après rafraîchissement.
-
-**Sécurité : mode test uniquement.** Le démarrage exige `MMS_TEST_MODE=1`. Il n'y a pas d'authentification ni de droits par rôle, le mot de passe DB de Compose est une valeur locale de test, et aucune notification/SMS ou prise en charge automatique n'existe. Le site web est accessible sur le réseau local via `8080`, ce qui expose aussi `/api` à quiconque peut joindre cette adresse. Ne pas exposer ce service à Internet avant d'ajouter les protections nécessaires.
+`npm run build` compile le backend. `npm run test:unit` teste les providers avec des réponses Orange simulées, notamment le cache OAuth, l'expiration, les erreurs et l'absence de retry sur résultat ambigu. `npm run test:integration` vérifie l'API et le parcours client contre une instance Docker locale en mode console ; ce test crée des données de test.

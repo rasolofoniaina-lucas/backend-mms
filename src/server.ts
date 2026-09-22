@@ -1,16 +1,17 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
+import { createSmsProvider, SmsProviderError } from './sms-provider.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
 if (!process.env.OTP_PEPPER || !process.env.ACCESS_TOKEN_SECRET) throw new Error('OTP_PEPPER et ACCESS_TOKEN_SECRET sont requis.');
 const otpPepper = process.env.OTP_PEPPER;
 const accessSecret = process.env.ACCESS_TOKEN_SECRET;
 const testMode = process.env.MMS_TEST_MODE === '1';
-if (!testMode && (process.env.SMS_PROVIDER || 'console') === 'console') throw new Error('SMS_PROVIDER=console est réservé au mode test.');
+const smsProvider = createSmsProvider(process.env);
 const cookieSecure = process.env.COOKIE_SECURE === '1' || process.env.NODE_ENV === 'production';
 const termsVersion = process.env.TERMS_VERSION || '1.0';
 const privacyVersion = process.env.PRIVACY_VERSION || '1.0';
@@ -198,16 +199,18 @@ async function createChallenge(req: IncomingMessage, input: Record<string, unkno
   if (purpose === 'phone_change' && exists.rowCount && exists.rows[0].id !== userId) throw new HttpError(409, 'Ce numéro est déjà utilisé par un autre compte.');
   if (purpose === 'phone_change' && exists.rowCount && exists.rows[0].id === userId) throw new HttpError(400, 'Le nouveau numéro doit être différent de l’actuel.');
   const id = randomUUID(); const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
-  await pool.query(`UPDATE otp_challenges SET consumed_at=now() WHERE phone_e164=$1 AND purpose=$2 AND consumed_at IS NULL`, [phone, purpose]);
-  await pool.query(`INSERT INTO otp_challenges (id,phone_e164,purpose,otp_digest,registration_first_name,registration_last_name,terms_accepted,privacy_accepted,user_id,expires_at,resend_available_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now()+interval '5 minutes',now()+interval '60 seconds')`, [id, phone, purpose, otpDigest(id, code), firstName, lastName, purpose === 'register' || null, purpose === 'register' || null, userId || null]);
-  // Console provider is intentionally restricted to controlled tests/development.
-  if ((process.env.SMS_PROVIDER || 'console') === 'console' && testMode) {
-    // Docker-only test outbox; no code is logged or returned through HTTP.
-    await writeFile(`/tmp/mms-test-otp-${id}`, code, { mode: 0o600 });
-    console.info(`MMS test OTP issued for challenge ${id}`);
-  }
-  if ((process.env.SMS_PROVIDER || 'console') === 'orange') throw new HttpError(503, 'Impossible d’envoyer le code pour le moment.');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE otp_challenges SET consumed_at=now() WHERE phone_e164=$1 AND purpose=$2 AND consumed_at IS NULL`, [phone, purpose]);
+    await client.query(`INSERT INTO otp_challenges (id,phone_e164,purpose,otp_digest,registration_first_name,registration_last_name,terms_accepted,privacy_accepted,user_id,expires_at,resend_available_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now()+interval '5 minutes',now()+interval '60 seconds')`, [id, phone, purpose, otpDigest(id, code), firstName, lastName, purpose === 'register' || null, purpose === 'register' || null, userId || null]);
+    await smsProvider.sendOtp({ challengeId: id, phone, code });
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally { client.release(); }
   return { challengeId: id, phone: maskedPhone(phone), expiresInSeconds: 300, resendInSeconds: 60 };
 }
 async function verifyChallenge(req: IncomingMessage, input: Record<string, unknown>, purpose: 'register' | 'login' | 'phone_change', res: ServerResponse, authorizedUserId?: string) {
@@ -438,6 +441,10 @@ async function start() {
   const server = createServer((req, res) => {
     route(req, res).catch(error => {
       if (error instanceof HttpError) return send(res, error.status, { error: error.message });
+      if (error instanceof SmsProviderError) {
+        console.error('Envoi Orange SMS indisponible', { phase: error.phase, status: error.status || 'network-or-response' });
+        return send(res, 503, { error: 'Impossible d’envoyer le code pour le moment. Réessayez plus tard.' });
+      }
       console.error('Erreur API MMS', error);
       send(res, 500, { error: 'Erreur interne du serveur.' });
     });
