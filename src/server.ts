@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Pool } from 'pg';
@@ -10,6 +10,7 @@ if (!process.env.OTP_PEPPER || !process.env.ACCESS_TOKEN_SECRET) throw new Error
 const otpPepper = process.env.OTP_PEPPER;
 const accessSecret = process.env.ACCESS_TOKEN_SECRET;
 const testMode = process.env.MMS_TEST_MODE === '1';
+if (!testMode && (process.env.SMS_PROVIDER || 'console') === 'console') throw new Error('SMS_PROVIDER=console est réservé au mode test.');
 const cookieSecure = process.env.COOKIE_SECURE === '1' || process.env.NODE_ENV === 'production';
 const termsVersion = process.env.TERMS_VERSION || '1.0';
 const privacyVersion = process.env.PRIVACY_VERSION || '1.0';
@@ -62,15 +63,21 @@ function verifyAccessToken(value: string): Identity {
   const [header, payload, signature] = value.split('.');
   if (!header || !payload || !signature) throw new HttpError(401, 'Session expirée.');
   const expected = createHmac('sha256', accessSecret).update(`${header}.${payload}`).digest('base64url');
-  if (!timingSafeEqual(Buffer.from(expected), Buffer.from(signature))) throw new HttpError(401, 'Session expirée.');
+  if (expected.length !== signature.length || !timingSafeEqual(Buffer.from(expected), Buffer.from(signature))) throw new HttpError(401, 'Session expirée.');
   try { const token = JSON.parse(Buffer.from(payload, 'base64url').toString()) as { sub: string; cid: string; sid: string; role: string; exp: number };
     if (token.exp * 1000 <= Date.now() || token.role !== 'customer') throw new Error(); return { userId: token.sub, customerId: token.cid, sessionId: token.sid, role: token.role };
   } catch { throw new HttpError(401, 'Session expirée.'); }
 }
-function identity(req: IncomingMessage) {
+async function identity(req: IncomingMessage) {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) throw new HttpError(401, 'Connexion requise.');
-  return verifyAccessToken(header.slice(7));
+  const auth = verifyAccessToken(header.slice(7));
+  const active = await pool.query(`SELECT 1 FROM user_sessions s JOIN users u ON u.id=s.user_id
+    JOIN customers c ON c.user_id=u.id WHERE s.id=$1 AND s.user_id=$2 AND c.id=$3
+    AND s.revoked_at IS NULL AND s.expires_at>now() AND u.status='active' AND u.role='customer'`,
+  [auth.sessionId, auth.userId, auth.customerId]);
+  if (!active.rowCount) throw new HttpError(401, 'Session expirée.');
+  return auth;
 }
 function cookie(req: IncomingMessage, name: string) { return req.headers.cookie?.split(';').map(x => x.trim()).find(x => x.startsWith(`${name}=`))?.slice(name.length + 1); }
 function refreshCookie(value: string, expiresAt: Date) { return `mms_refresh=${value}; Path=/api/auth; HttpOnly; SameSite=Lax; ${cookieSecure ? 'Secure; ' : ''}Expires=${expiresAt.toUTCString()}`; }
@@ -177,6 +184,9 @@ async function issueSession(userId: string, customerId: string, req: IncomingMes
 }
 async function createChallenge(req: IncomingMessage, input: Record<string, unknown>, purpose: 'register' | 'login' | 'phone_change', userId?: string) {
   const phone = normalizePhone(input.phone); limit(`otp:ip:${clientIp(req)}`, 12, 15 * 60_000); limit(`otp:phone:${phone}`, 4, 15 * 60_000);
+  const last = await pool.query(`SELECT resend_available_at FROM otp_challenges WHERE phone_e164=$1 AND purpose=$2
+    AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1`, [phone, purpose]);
+  if (last.rowCount && new Date(last.rows[0].resend_available_at) > new Date()) throw new HttpError(429, 'Attendez une minute avant de demander un nouveau code.');
   const exists = await pool.query(`SELECT u.id FROM users u WHERE u.phone_e164 = $1 AND u.status = 'active'`, [phone]);
   if (purpose === 'register' && exists.rowCount) throw new HttpError(409, 'Un compte existe déjà avec ce numéro. Connectez-vous.');
   if (purpose === 'login' && !exists.rowCount) throw new HttpError(404, 'Aucun compte ne correspond à ce numéro. Créez votre compte.');
@@ -186,15 +196,21 @@ async function createChallenge(req: IncomingMessage, input: Record<string, unkno
     if (input.termsAccepted !== true || input.privacyAccepted !== true) throw new HttpError(400, 'Vous devez accepter les conditions et la politique de confidentialité.');
   }
   if (purpose === 'phone_change' && exists.rowCount && exists.rows[0].id !== userId) throw new HttpError(409, 'Ce numéro est déjà utilisé par un autre compte.');
+  if (purpose === 'phone_change' && exists.rowCount && exists.rows[0].id === userId) throw new HttpError(400, 'Le nouveau numéro doit être différent de l’actuel.');
   const id = randomUUID(); const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
+  await pool.query(`UPDATE otp_challenges SET consumed_at=now() WHERE phone_e164=$1 AND purpose=$2 AND consumed_at IS NULL`, [phone, purpose]);
   await pool.query(`INSERT INTO otp_challenges (id,phone_e164,purpose,otp_digest,registration_first_name,registration_last_name,terms_accepted,privacy_accepted,user_id,expires_at,resend_available_at)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now()+interval '5 minutes',now()+interval '60 seconds')`, [id, phone, purpose, otpDigest(id, code), firstName, lastName, purpose === 'register' || null, purpose === 'register' || null, userId || null]);
   // Console provider is intentionally restricted to controlled tests/development.
-  if ((process.env.SMS_PROVIDER || 'console') === 'console' && testMode) console.info(`MMS OTP issued for challenge ${id}`);
+  if ((process.env.SMS_PROVIDER || 'console') === 'console' && testMode) {
+    // Docker-only test outbox; no code is logged or returned through HTTP.
+    await writeFile(`/tmp/mms-test-otp-${id}`, code, { mode: 0o600 });
+    console.info(`MMS test OTP issued for challenge ${id}`);
+  }
   if ((process.env.SMS_PROVIDER || 'console') === 'orange') throw new HttpError(503, 'Impossible d’envoyer le code pour le moment.');
   return { challengeId: id, phone: maskedPhone(phone), expiresInSeconds: 300, resendInSeconds: 60 };
 }
-async function verifyChallenge(req: IncomingMessage, input: Record<string, unknown>, purpose: 'register' | 'login' | 'phone_change', res: ServerResponse) {
+async function verifyChallenge(req: IncomingMessage, input: Record<string, unknown>, purpose: 'register' | 'login' | 'phone_change', res: ServerResponse, authorizedUserId?: string) {
   const challengeId = uuid(typeof input.challengeId === 'string' ? input.challengeId : undefined); const code = textField(input.code, 'Code OTP', 6, 6);
   if (!/^\d{6}$/.test(code)) throw new HttpError(400, 'Le code doit contenir six chiffres.'); limit(`verify:ip:${clientIp(req)}`, 20, 15 * 60_000);
   const client = await pool.connect();
@@ -202,6 +218,7 @@ async function verifyChallenge(req: IncomingMessage, input: Record<string, unkno
     await client.query('BEGIN'); const result = await client.query('SELECT * FROM otp_challenges WHERE id=$1 FOR UPDATE', [challengeId]);
     if (!result.rowCount || result.rows[0].purpose !== purpose || result.rows[0].consumed_at) throw new HttpError(400, 'Demande OTP introuvable. Recommencez.');
     const challenge = result.rows[0];
+    if (purpose === 'phone_change' && challenge.user_id !== authorizedUserId) throw new HttpError(403, 'Accès refusé.');
     if (new Date(challenge.expires_at) < new Date()) throw new HttpError(410, 'Ce code a expiré. Demandez-en un nouveau.');
     if (challenge.attempts_remaining <= 0) throw new HttpError(429, 'Trop de tentatives. Réessayez dans quelques minutes.');
     if (!safeEqualHex(challenge.otp_digest, otpDigest(challengeId, code))) { await client.query('UPDATE otp_challenges SET attempts_remaining=attempts_remaining-1 WHERE id=$1', [challengeId]); await client.query('COMMIT'); throw new HttpError(400, 'Le code saisi est incorrect.'); }
@@ -223,6 +240,7 @@ async function verifyChallenge(req: IncomingMessage, input: Record<string, unkno
       await client.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL', [userId]);
     }
     await client.query('UPDATE otp_challenges SET consumed_at=now() WHERE id=$1', [challengeId]); await client.query('COMMIT');
+    if (testMode) await unlink(`/tmp/mms-test-otp-${challengeId}`).catch(() => undefined);
     return await issueSession(userId, customerId!, req, res);
   } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; } finally { client.release(); }
 }
@@ -243,8 +261,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (method === 'POST' && parts[2] === 'register' && parts[3] === 'verify-otp') return send(res, 201, await verifyChallenge(req, await body(req), 'register', res));
     if (method === 'POST' && parts[2] === 'login' && parts[3] === 'request-otp') return send(res, 200, await createChallenge(req, await body(req), 'login'));
     if (method === 'POST' && parts[2] === 'login' && parts[3] === 'verify-otp') return send(res, 200, await verifyChallenge(req, await body(req), 'login', res));
-    if (method === 'POST' && parts[2] === 'phone-change' && parts[3] === 'request-otp') { const auth = identity(req); return send(res, 200, await createChallenge(req, await body(req), 'phone_change', auth.userId)); }
-    if (method === 'POST' && parts[2] === 'phone-change' && parts[3] === 'verify-otp') { identity(req); return send(res, 200, await verifyChallenge(req, await body(req), 'phone_change', res)); }
+    if (method === 'POST' && parts[2] === 'phone-change' && parts[3] === 'request-otp') { const auth = await identity(req); return send(res, 200, await createChallenge(req, await body(req), 'phone_change', auth.userId)); }
+    if (method === 'POST' && parts[2] === 'phone-change' && parts[3] === 'verify-otp') { const auth = await identity(req); return send(res, 200, await verifyChallenge(req, await body(req), 'phone_change', res, auth.userId)); }
     if (method === 'POST' && parts[2] === 'refresh') {
       limit(`refresh:${clientIp(req)}`, 30, 15 * 60_000); const token = cookie(req, 'mms_refresh'); if (!token) throw new HttpError(401, 'Session expirée.');
       const hash = createHmac('sha256', accessSecret).update(token).digest('hex'); const found = await pool.query(`SELECT s.id,s.user_id,c.id AS customer_id FROM user_sessions s JOIN customers c ON c.user_id=s.user_id WHERE s.refresh_token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now()`, [hash]);
@@ -252,7 +270,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       return send(res, 200, await issueSession(found.rows[0].user_id, found.rows[0].customer_id, req, res));
     }
     if (method === 'POST' && parts[2] === 'logout') { const token = cookie(req, 'mms_refresh'); if (token) await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE refresh_token_hash=$1', [createHmac('sha256', accessSecret).update(token).digest('hex')]); res.setHeader('Set-Cookie', clearRefreshCookie()); return send(res, 200, { ok: true }); }
-    const auth = identity(req);
+    const auth = await identity(req);
     if (method === 'GET' && parts[2] === 'me') return send(res, 200, await customerData(auth.customerId));
     if (method === 'GET' && parts[2] === 'sessions') { const sessions = await pool.query(`SELECT id,device_label,created_at AS "createdAt",last_seen_at AS "lastSeenAt", id=$2 AS "current" FROM user_sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>now() ORDER BY last_seen_at DESC`, [auth.userId, auth.sessionId]); return send(res, 200, sessions.rows); }
     if (method === 'DELETE' && parts[2] === 'sessions' && parts[3]) { const id = uuid(parts[3]); await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE id=$1 AND user_id=$2', [id, auth.userId]); return send(res, 200, { ok: true }); }
@@ -270,14 +288,14 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   }
   if (parts[1] === 'customers' && parts[2]) {
     const customerId = uuid(parts[2]);
-    const auth = identity(req);
+    const auth = await identity(req);
     if (auth.customerId !== customerId) throw new HttpError(403, 'Accès refusé.');
     if (method === 'GET' && parts.length === 3) return send(res, 200, await customerData(customerId));
     if (method === 'PATCH' && parts.length === 3) {
       const input = await body(req);
       const name = textField(input.name, 'Prénom', 1, 80);
       if (input.phone !== undefined) throw new HttpError(400, 'Le changement de numéro requiert une confirmation OTP.');
-      const result = await pool.query('UPDATE customers SET name = $2 WHERE id = $1 RETURNING name, phone', [customerId, name]);
+      const result = await pool.query('UPDATE customers SET first_name = $2, name = $2 || \' \' || COALESCE(last_name, \'\') WHERE id = $1 RETURNING name, phone', [customerId, name]);
       if (!result.rowCount) throw new HttpError(404, 'Client introuvable.');
       return send(res, 200, result.rows[0]);
     }

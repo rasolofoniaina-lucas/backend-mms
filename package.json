@@ -5,7 +5,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+    "test:integration": "node --test test/auth.integration.test.mjs"
   },
   "dependencies": {
     "libphonenumber-js": "^1.13.13",
