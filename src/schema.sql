@@ -187,6 +187,21 @@ CREATE TABLE IF NOT EXISTS admin_audit_events (
 );
 CREATE INDEX IF NOT EXISTS admin_audit_actor_idx ON admin_audit_events(actor_user_id, created_at DESC);
 
+CREATE OR REPLACE FUNCTION reject_mms_audit_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'Audit history is append-only';
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='ticket_events_append_only') THEN
+    CREATE TRIGGER ticket_events_append_only BEFORE UPDATE OR DELETE ON ticket_events
+      FOR EACH ROW EXECUTE FUNCTION reject_mms_audit_mutation();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='admin_audit_append_only') THEN
+    CREATE TRIGGER admin_audit_append_only BEFORE UPDATE OR DELETE ON admin_audit_events
+      FOR EACH ROW EXECUTE FUNCTION reject_mms_audit_mutation();
+  END IF;
+END $$;
+
 -- Backfill each legacy appointment exactly once. Appointment remains the slot truth.
 INSERT INTO tickets (id, reference, customer_id, vehicle_id, appointment_id, intervention_type, description, status, created_by_user_id, created_at, updated_at, completed_at, cancelled_at)
 SELECT gen_random_uuid(), 'MMS-' || extract(year FROM a.created_at)::integer || '-' || lpad(nextval('ticket_reference_seq')::text, 6, '0'),

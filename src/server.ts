@@ -402,12 +402,16 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       const ticket = await staffTicket(reference, auth, true, client);
       if (!canTransition(ticket.status, status, auth.role)) throw new HttpError(409, 'Transition de statut interdite.');
       if (status === 'assigned' && !ticket.assignedMechanicUserId) throw new HttpError(409, 'Assignez d’abord un mécanicien.');
-      await client.query(`UPDATE tickets SET status=$2,updated_at=now(),completed_at=CASE WHEN $2='completed' THEN now() ELSE completed_at END,
+      await client.query(`UPDATE tickets SET status=$2,updated_at=now(),
+        assigned_mechanic_user_id=CASE WHEN $2='triage' THEN NULL ELSE assigned_mechanic_user_id END,
+        completed_at=CASE WHEN $2='completed' THEN now() ELSE completed_at END,
         cancelled_at=CASE WHEN $2='cancelled' THEN now() ELSE cancelled_at END WHERE id=$1`, [ticket.id, status]);
       await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,old_value,new_value)
         VALUES ($1,$2,$3,$4,$5)`, [ticket.id, auth.userId, status === 'completed' ? 'ticket_completed' : status === 'cancelled' ? 'ticket_cancelled' : 'status_changed', ticket.status, status]);
+      if (status === 'triage' && ticket.assignedMechanicUserId) await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,old_value,new_value)
+        VALUES ($1,$2,'mechanic_reassigned',$3,NULL)`, [ticket.id, auth.userId, ticket.assignedMechanicUserId]);
       if (ticket.appointmentId) {
-        const mapped: Record<string,string> = { assigned: 'Pris en charge', in_progress: 'En cours', completed: 'Terminé', cancelled: 'Annulé' };
+        const mapped: Record<string,string> = { triage: ticket.interventionType === 'Urgence' ? 'Dépannage demandé' : 'Confirmé', assigned: 'Pris en charge', in_progress: 'En cours', completed: 'Terminé', cancelled: 'Annulé' };
         if (mapped[status]) await client.query('UPDATE appointments SET status=$2 WHERE id=$1', [ticket.appointmentId, mapped[status]]);
       }
       await client.query('COMMIT');
