@@ -6,9 +6,9 @@ import { randomInt } from 'node:crypto';
 const base = process.env.MMS_API_URL || 'http://127.0.0.1:8080';
 const container = process.env.MMS_API_CONTAINER || 'mms-api-1';
 const suffix = randomInt(10000, 90000);
-const phoneA = `+2613412${suffix}`;
-const phoneB = `+2613412${suffix + 1}`;
-const phoneNew = `+2613412${suffix + 2}`;
+const phoneA = `+2613712${suffix}`;
+const phoneB = `+2613712${suffix + 1}`;
+const phoneNew = `+2613712${suffix + 2}`;
 
 async function api(path, { method = 'GET', body, token, cookie } = {}) {
   const response = await fetch(`${base}/api${path}`, {
