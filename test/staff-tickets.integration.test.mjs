@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
 import { runCustomerPasswordResetTests } from './customer-password-reset.integration.test.mjs';
+import { runCustomerPasswordChangeTests } from './customer-password-change.integration.test.mjs';
 
 const base = process.env.MMS_API_URL || 'http://127.0.0.1:8080';
 const container = process.env.MMS_API_CONTAINER || 'mms-api-1';
@@ -80,6 +81,7 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
   const mecaA = await activate(mechanicAUsername, aCreated.temporaryPassword);
   const mecaB = await activate(mechanicBUsername, bCreated.temporaryPassword);
   await runCustomerPasswordResetTests(t, { admin, manager: chef, mechanic: mecaA, mechanicUser: aCreated });
+  await runCustomerPasswordChangeTests(t, { admin, manager: chef });
   await t.test('rôles staff et frontières admin', async () => {
     assert.equal((await api('/admin/users', { token: chef.data.accessToken })).status, 403);
     assert.equal((await api('/admin/users', { token: mecaA.data.accessToken })).status, 403);

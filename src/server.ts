@@ -33,7 +33,7 @@ const vehicleFields = `v.id, v.name, v.model, v.plate, v.color,
     '/photo?updated=' || (extract(epoch from p.updated_at) * 1000)::bigint ELSE NULL END AS "photoUrl"`;
 
 class HttpError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string, public code?: string) { super(message); }
 }
 
 type Identity = { userId: string; customerId: string; sessionId: string; role: Role; mustChangePassword?: boolean };
@@ -99,15 +99,18 @@ async function identity(req: IncomingMessage, allowed: readonly Role[] = ['custo
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) throw new HttpError(401, 'Connexion requise.');
   const auth = verifyAccessToken(header.slice(7));
-  const active = await pool.query(`SELECT u.role,COALESCE(lc.must_change_password,false) AS must_change_password,c.id AS customer_id FROM user_sessions s
-    JOIN users u ON u.id=s.user_id LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id
+  const active = await pool.query(`SELECT u.role,COALESCE(lc.must_change_password,false) AS staff_must_change_password,
+    COALESCE(cc.must_change_password,false) AS customer_must_change_password,c.id AS customer_id FROM user_sessions s
+    JOIN users u ON u.id=s.user_id LEFT JOIN customers c ON c.user_id=u.id
+    LEFT JOIN local_credentials lc ON lc.user_id=u.id LEFT JOIN customer_credentials cc ON cc.user_id=u.id
     WHERE s.id=$1 AND s.user_id=$2 AND s.revoked_at IS NULL AND s.expires_at>now() AND u.status='active'`,
   [auth.sessionId, auth.userId]);
   if (!active.rowCount || active.rows[0].role !== auth.role || (auth.role === 'customer' && active.rows[0].customer_id !== auth.customerId)) throw new HttpError(401, 'Session expirée.');
   if (!allowed.includes(auth.role)) throw new HttpError(403, 'Accès refusé.');
-  if (active.rows[0].must_change_password && !allowPasswordChange) throw new HttpError(403, 'Vous devez changer votre mot de passe.');
+  const mustChangePassword = auth.role === 'customer' ? active.rows[0].customer_must_change_password : active.rows[0].staff_must_change_password;
+  if (mustChangePassword && !allowPasswordChange) throw new HttpError(403, 'Vous devez changer votre mot de passe.', auth.role === 'customer' ? 'PASSWORD_CHANGE_REQUIRED' : undefined);
   await pool.query(`UPDATE user_sessions SET last_seen_at=now() WHERE id=$1 AND last_seen_at < now()-interval '1 minute'`, [auth.sessionId]);
-  return { ...auth, mustChangePassword: active.rows[0].must_change_password };
+  return { ...auth, mustChangePassword };
 }
 function cookie(req: IncomingMessage, name: string) { return req.headers.cookie?.split(';').map(x => x.trim()).find(x => x.startsWith(`${name}=`))?.slice(name.length + 1); }
 function refreshCookie(value: string, expiresAt: Date) { return `mms_refresh=${value}; Path=/api/auth; HttpOnly; SameSite=Lax; ${cookieSecure ? 'Secure; ' : ''}Expires=${expiresAt.toUTCString()}`; }
@@ -272,14 +275,29 @@ async function customerData(id: string) {
   return { user: customer.rows[0], vehicles: vehicles.rows, appointments: appointments.rows, maintenance: maintenance.rows, messages: messages.rows.map(row => row.body), tickets: tickets.rows };
 }
 
-async function issueSession(userId: string, customerId: string, req: IncomingMessage, res: ServerResponse, role: Role = 'customer') {
+async function issueSession(userId: string, customerId: string, req: IncomingMessage, res: ServerResponse, role: Role = 'customer', expectedCustomerPasswordHash?: string | null) {
+  const credential = role === 'customer' ? await pool.query(`SELECT must_change_password,temporary_password_expires_at FROM customer_credentials WHERE user_id=$1`, [userId]) : null;
+  const restricted = role === 'customer' && credential?.rows[0]?.must_change_password === true;
+  if (restricted && (!credential?.rows[0]?.temporary_password_expires_at || new Date(credential.rows[0].temporary_password_expires_at) <= new Date())) throw new HttpError(401, "Ce mot de passe temporaire a expiré. Contactez l'atelier.");
   const sessionId = randomUUID(); const refresh = randomBytes(32).toString('base64url'); const hash = createHmac('sha256', accessSecret).update(refresh).digest('hex');
-  const expires = new Date(Date.now() + (role === 'customer' ? 90 : 30) * 24 * 60 * 60 * 1000);
+  // Restricted sessions last 15 minutes. A refresh may rotate them only while
+  // the temporary credential is valid; an already issued session may finish
+  // the password change during its remaining short lifetime.
+  const expires = new Date(Date.now() + (restricted ? 15 * 60 * 1000 : (role === 'customer' ? 90 : 30) * 24 * 60 * 60 * 1000));
   const agent = String(req.headers['user-agent'] || '').slice(0, 300);
   const label = /android/i.test(agent) ? 'Navigateur Android' : /iphone|ipad/i.test(agent) ? 'Navigateur iOS' : 'Navigateur web';
   await pool.query(`INSERT INTO user_sessions (id,user_id,refresh_token_hash,user_agent,device_label,expires_at) VALUES ($1,$2,$3,$4,$5,$6)`, [sessionId, userId, hash, agent, label, expires]);
+  if (role === 'customer' && expectedCustomerPasswordHash !== undefined) {
+    const current = await pool.query('SELECT password_hash FROM customer_credentials WHERE user_id=$1', [userId]);
+    if ((current.rows[0]?.password_hash || null) !== expectedCustomerPasswordHash) {
+      await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE id=$1', [sessionId]);
+      throw new HttpError(401, 'Session expirée.');
+    }
+  }
   res.setHeader('Set-Cookie', refreshCookie(refresh, expires));
-  if (role === 'customer') return { accessToken: accessToken({ userId, customerId, sessionId, role }), user: await customerData(customerId) };
+  if (role === 'customer') return restricted
+    ? { accessToken: accessToken({ userId, customerId, sessionId, role }), user: { user: { id: customerId }, mustChangePassword: true }, mustChangePassword: true }
+    : { accessToken: accessToken({ userId, customerId, sessionId, role }), user: await customerData(customerId), mustChangePassword: false };
   const user = await pool.query(`SELECT u.id,u.username,u.first_name AS "firstName",u.last_name AS "lastName",u.email,u.role,
     lc.must_change_password AS "mustChangePassword" FROM users u JOIN local_credentials lc ON lc.user_id=u.id WHERE u.id=$1`, [userId]);
   return { accessToken: accessToken({ userId, customerId: '', sessionId, role }), user: user.rows[0] };
@@ -449,9 +467,41 @@ async function customerPasswordLogin(req: IncomingMessage, input: Record<string,
   const generic = new HttpError(401,'Identifiant ou mot de passe incorrect.');
   const found = await pool.query(`SELECT u.id AS user_id,c.id AS customer_id,cc.password_hash,cc.must_change_password,cc.temporary_password_expires_at FROM users u JOIN customers c ON c.user_id=u.id JOIN customer_credentials cc ON cc.user_id=u.id WHERE u.status='active' AND (($1::text IS NOT NULL AND lower(c.email)=lower($1)) OR ($2::text IS NOT NULL AND u.phone_e164=$2))`,[email,phone]);
   if (!found.rowCount || !await verifyPassword(found.rows[0].password_hash,password)) throw generic;
-  if (found.rows[0].temporary_password_expires_at && new Date(found.rows[0].temporary_password_expires_at) < new Date()) throw generic;
-  const session = await issueSession(found.rows[0].user_id,found.rows[0].customer_id,req,res);
+  if (found.rows[0].must_change_password && (!found.rows[0].temporary_password_expires_at || new Date(found.rows[0].temporary_password_expires_at) <= new Date())) throw new HttpError(401, "Ce mot de passe temporaire a expiré. Contactez l'atelier.");
+  const session = await issueSession(found.rows[0].user_id,found.rows[0].customer_id,req,res,'customer',found.rows[0].password_hash);
   return { ...session, mustChangePassword: Boolean(found.rows[0].must_change_password) };
+}
+async function changeCustomerPassword(req: IncomingMessage, res: ServerResponse, input: Record<string, unknown>) {
+  const auth = await identity(req, ['customer'], true);
+  if (!auth.mustChangePassword) throw new HttpError(409, 'Aucun changement de mot de passe temporaire requis.');
+  const nextPassword = customerPassword(input.newPassword);
+  const digest = await hashPassword(nextPassword);
+  const sessionId = randomUUID();
+  const refresh = randomBytes(32).toString('base64url');
+  const refreshHash = createHmac('sha256', accessSecret).update(refresh).digest('hex');
+  const expires = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+  const agent = String(req.headers['user-agent'] || '').slice(0, 300);
+  const label = /android/i.test(agent) ? 'Navigateur Android' : /iphone|ipad/i.test(agent) ? 'Navigateur iOS' : 'Navigateur web';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const credential = await client.query(`SELECT cc.password_hash,cc.must_change_password FROM users u
+      JOIN customer_credentials cc ON cc.user_id=u.id WHERE u.id=$1 AND u.role='customer' AND u.status='active' FOR UPDATE OF u,cc`, [auth.userId]);
+    if (!credential.rowCount || !credential.rows[0].must_change_password) throw new HttpError(409, 'Le changement de mot de passe n’est plus requis.');
+    const currentSession = await client.query(`SELECT id FROM user_sessions WHERE id=$1 AND user_id=$2 AND revoked_at IS NULL AND expires_at>now() FOR UPDATE`, [auth.sessionId, auth.userId]);
+    if (!currentSession.rowCount) throw new HttpError(401, 'Session expirée.');
+    if (await verifyPassword(credential.rows[0].password_hash, nextPassword)) throw new HttpError(400, 'Choisissez un mot de passe différent du mot de passe temporaire.');
+    await client.query(`UPDATE customer_credentials SET password_hash=$2,must_change_password=false,
+      temporary_password_expires_at=NULL,password_changed_at=now(),updated_at=now() WHERE user_id=$1`, [auth.userId, digest]);
+    // Self-service changes use password_changed_at; admin_audit_events remains staff-action-only.
+    await client.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL', [auth.userId]);
+    await client.query(`INSERT INTO user_sessions(id,user_id,refresh_token_hash,user_agent,device_label,expires_at)
+      VALUES($1,$2,$3,$4,$5,$6)`, [sessionId, auth.userId, refreshHash, agent, label, expires]);
+    await client.query('COMMIT');
+  } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; } finally { client.release(); }
+  res.setHeader('Set-Cookie', refreshCookie(refresh, expires));
+  return { accessToken: accessToken({ userId: auth.userId, customerId: auth.customerId, sessionId, role: 'customer' }),
+    user: await customerData(auth.customerId), mustChangePassword: false };
 }
 async function createRecoveryRequest(req: IncomingMessage, input: Record<string, unknown>) {
   const identifier = textField(input.identifier, 'Identifiant', 3, 254); let normalized: string; let type: 'email'|'phone';
@@ -826,16 +876,22 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       limit(`refresh:${clientIp(req)}`, 30, 15 * 60_000); const token = cookie(req, 'mms_refresh'); if (!token) throw new HttpError(401, 'Session expirée.');
       const hash = createHmac('sha256', accessSecret).update(token).digest('hex');
       const found = await pool.query(`UPDATE user_sessions s SET revoked_at=now() FROM users u
-        LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id WHERE s.user_id=u.id AND s.refresh_token_hash=$1
+        LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id
+        LEFT JOIN customer_credentials cc ON cc.user_id=u.id WHERE s.user_id=u.id AND s.refresh_token_hash=$1
         AND s.revoked_at IS NULL AND s.expires_at>now() AND u.status='active'
-        RETURNING s.user_id,u.role,COALESCE(lc.must_change_password,false) AS must_change_password,c.id AS customer_id`, [hash]);
+        RETURNING s.user_id,u.role,COALESCE(lc.must_change_password,false) AS must_change_password,c.id AS customer_id,cc.password_hash AS customer_password_hash`, [hash]);
       if (!found.rowCount) throw new HttpError(401, 'Session expirée.');
-      return send(res, 200, await issueSession(found.rows[0].user_id, found.rows[0].customer_id || '', req, res, found.rows[0].role));
+      return send(res, 200, await issueSession(found.rows[0].user_id, found.rows[0].customer_id || '', req, res, found.rows[0].role,
+        found.rows[0].role === 'customer' ? found.rows[0].customer_password_hash : undefined));
     }
     if (method === 'POST' && parts[2] === 'logout') { const token = cookie(req, 'mms_refresh'); if (token) await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE refresh_token_hash=$1', [createHmac('sha256', accessSecret).update(token).digest('hex')]); res.setHeader('Set-Cookie', clearRefreshCookie()); return send(res, 200, { ok: true }); }
+    if (method === 'POST' && parts[2] === 'change-password' && parts.length === 3) return send(res, 200, await changeCustomerPassword(req, res, await body(req)));
+    if (method === 'GET' && parts[2] === 'me' && parts.length === 3) {
+      const auth = await identity(req, ['customer'], true);
+      return send(res, 200, auth.mustChangePassword ? { user: { id: auth.customerId }, mustChangePassword: true } : await customerData(auth.customerId));
+    }
     const auth = await identity(req);
     if (method === 'POST' && parts[2] === 'pin' && parts.length === 3) return setCustomerPin(req, await body(req), res);
-    if (method === 'GET' && parts[2] === 'me') return send(res, 200, await customerData(auth.customerId));
     if (method === 'GET' && parts[2] === 'sessions') { const sessions = await pool.query(`SELECT id,device_label,created_at AS "createdAt",last_seen_at AS "lastSeenAt", id=$2 AS "current" FROM user_sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>now() ORDER BY last_seen_at DESC`, [auth.userId, auth.sessionId]); return send(res, 200, sessions.rows); }
     if (method === 'DELETE' && parts[2] === 'sessions' && parts[3]) { const id = uuid(parts[3]); await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE id=$1 AND user_id=$2', [id, auth.userId]); return send(res, 200, { ok: true }); }
     if (method === 'POST' && parts[2] === 'logout-all') { await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1', [auth.userId]); res.setHeader('Set-Cookie', clearRefreshCookie()); return send(res, 200, { ok: true }); }
@@ -1051,7 +1107,7 @@ async function start() {
   const proxyTimer = setInterval(() => { void refreshTrustedNginx(); }, 15_000);
   const server = createServer((req, res) => {
     route(req, res).catch(error => {
-      if (error instanceof HttpError) return send(res, error.status, { error: error.message });
+      if (error instanceof HttpError) return send(res, error.status, error.code ? { error: error.message, code: error.code } : { error: error.message });
       if (error instanceof SmsProviderError) {
         console.error('Envoi Orange SMS indisponible', { phase: error.phase, status: error.status || 'network-or-response' });
         return send(res, 503, { error: 'Impossible d’envoyer le code pour le moment. Réessayez plus tard.' });
