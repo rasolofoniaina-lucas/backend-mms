@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomInt, randomUUID } from 'node:crypto';
+import { runCustomerPasswordResetTests } from './customer-password-reset.integration.test.mjs';
 
 const base = process.env.MMS_API_URL || 'http://127.0.0.1:8080';
 const container = process.env.MMS_API_CONTAINER || 'mms-api-1';
@@ -78,6 +79,7 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
   const chef = await activate(managerUsername, chefCreated.temporaryPassword);
   const mecaA = await activate(mechanicAUsername, aCreated.temporaryPassword);
   const mecaB = await activate(mechanicBUsername, bCreated.temporaryPassword);
+  await runCustomerPasswordResetTests(t, { admin, manager: chef, mechanic: mecaA, mechanicUser: aCreated });
   await t.test('rôles staff et frontières admin', async () => {
     assert.equal((await api('/admin/users', { token: chef.data.accessToken })).status, 403);
     assert.equal((await api('/admin/users', { token: mecaA.data.accessToken })).status, 403);
@@ -97,7 +99,9 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
     assert.equal(adminList.status, 200); assert.equal(managerList.status, 200);
     const entry = adminList.data.find(item => item.phoneMasked === '037 ** *** **');
     assert.ok(entry); assert.equal(entry.status, 'pending'); assert.equal(entry.customer, 'Client Recette');
-    assert.deepEqual(Object.keys(entry).sort(), ['createdAt','customer','emailMasked','id','phoneMasked','status'].sort());
+    assert.deepEqual(Object.keys(entry).sort(), ['createdAt','customer','emailMasked','id','phoneMasked','status','userId'].sort());
+    assert.match(entry.userId, /^[0-9a-f-]{36}$/);
+    assert.notEqual(entry.userId, clientId);
     assert.equal(entry.emailMasked, null); assert.equal(JSON.stringify(adminList.data).includes(phone), false);
     assert.deepEqual(managerList.data, adminList.data);
     assert.equal((await api('/staff/access-requests', { token: mecaA.data.accessToken })).status, 403);

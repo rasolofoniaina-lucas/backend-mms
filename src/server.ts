@@ -482,10 +482,39 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
   }
   if (method === 'GET' && parts[2] === 'access-requests' && parts.length === 3) {
     await requireRole(req, ['workshop_manager','admin']);
-    const rows = await pool.query(`SELECT r.id,r.status,r.created_at AS "createdAt",CASE WHEN r.identifier_type='email' THEN r.identifier_masked ELSE NULL END AS "emailMasked",CASE WHEN r.identifier_type='phone' THEN r.identifier_masked ELSE NULL END AS "phoneMasked",CASE WHEN c.id IS NULL THEN NULL ELSE COALESCE(NULLIF(concat_ws(' ',c.first_name,c.last_name),''),c.name) END AS customer FROM customer_access_requests r LEFT JOIN customers c ON c.id=r.customer_id WHERE r.status='pending' AND r.type='password_reset' ORDER BY r.created_at DESC`);
+    const rows = await pool.query(`SELECT r.id,r.user_id AS "userId",r.status,r.created_at AS "createdAt",CASE WHEN r.identifier_type='email' THEN r.identifier_masked ELSE NULL END AS "emailMasked",CASE WHEN r.identifier_type='phone' THEN r.identifier_masked ELSE NULL END AS "phoneMasked",CASE WHEN c.id IS NULL THEN NULL ELSE COALESCE(NULLIF(concat_ws(' ',c.first_name,c.last_name),''),c.name) END AS customer FROM customer_access_requests r LEFT JOIN customers c ON c.id=r.customer_id WHERE r.status='pending' AND r.type='password_reset' ORDER BY r.created_at DESC`);
     return send(res,200,rows.rows);
   }
   const auth = await requireRole(req, allStaffRoles, ['me','change-password','logout-all'].includes(parts[2]));
+  if (method === 'POST' && parts[2] === 'customers' && parts[3] && parts[4] === 'reset-password' && parts.length === 5) {
+    if (!['workshop_manager','admin'].includes(auth.role)) throw new HttpError(403, 'Accès refusé.');
+    const targetId = uuid(parts[3]);
+    const input = await body(req);
+    const requestId = input.requestId == null ? null : uuid(typeof input.requestId === 'string' ? input.requestId : undefined);
+    limit(`customer-reset:${auth.userId}`, 20, 60 * 60_000);
+    const temporary = temporaryPassword();
+    const digest = await hashPassword(temporary);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const target = await client.query(`SELECT u.id FROM users u JOIN customers c ON c.user_id=u.id WHERE u.id=$1 AND u.role='customer' FOR UPDATE OF u`, [targetId]);
+      if (!target.rowCount) throw new HttpError(404, 'Compte client introuvable.');
+      if (requestId) {
+        const request = await client.query(`SELECT id FROM customer_access_requests WHERE id=$1 AND user_id=$2 AND status='pending' AND type='password_reset' FOR UPDATE`, [requestId, targetId]);
+        if (!request.rowCount) throw new HttpError(409, "Cette demande d'accès ne correspond pas au compte client ou n'est plus en attente.");
+      }
+      await client.query(`INSERT INTO customer_credentials(user_id,password_hash,must_change_password,temporary_password_expires_at,password_changed_at)
+        VALUES($1,$2,true,now()+interval '24 hours',NULL)
+        ON CONFLICT (user_id) DO UPDATE SET password_hash=excluded.password_hash,must_change_password=true,
+          temporary_password_expires_at=excluded.temporary_password_expires_at,password_changed_at=NULL,updated_at=now()`, [targetId, digest]);
+      await client.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL', [targetId]);
+      if (requestId) await client.query(`UPDATE customer_access_requests SET status='resolved',resolved_at=now(),resolved_by_user_id=$2 WHERE id=$1`, [requestId, auth.userId]);
+      await client.query(`INSERT INTO admin_audit_events(actor_user_id,target_user_id,action,request_id) VALUES($1,$2,'customer_password_reset',$3)`, [auth.userId, targetId, requestId]);
+      // A disabled account stays disabled; resetting credentials never changes users.status.
+      await client.query('COMMIT');
+      return send(res, 200, { temporaryPassword: temporary });
+    } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+  }
   if (method === 'GET' && parts[2] === 'me' && parts.length === 3) {
     const found = await pool.query(`SELECT u.id,u.username,u.first_name AS "firstName",u.last_name AS "lastName",u.email,u.role,
       lc.must_change_password AS "mustChangePassword" FROM users u JOIN local_credentials lc ON lc.user_id=u.id WHERE u.id=$1`, [auth.userId]);

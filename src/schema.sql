@@ -338,6 +338,7 @@ CREATE TABLE IF NOT EXISTS admin_audit_events (
   action text NOT NULL CHECK (action IN ('admin_created_user','admin_disabled_user','admin_enabled_user','admin_reset_password','admin_changed_role')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE admin_audit_events ADD COLUMN IF NOT EXISTS request_id uuid REFERENCES customer_access_requests(id);
 ALTER TABLE admin_audit_events DROP CONSTRAINT IF EXISTS admin_audit_events_action_check;
 ALTER TABLE admin_audit_events ADD CONSTRAINT admin_audit_events_action_check CHECK (action IN ('admin_created_user','admin_disabled_user','admin_enabled_user','admin_reset_password','admin_changed_role','customer_password_reset'));
 CREATE INDEX IF NOT EXISTS admin_audit_actor_idx ON admin_audit_events(actor_user_id, created_at DESC);
