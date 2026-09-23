@@ -398,16 +398,48 @@ async function registerCustomerPassword(req: IncomingMessage, input: Record<stri
   const firstName = textField(input.firstName, 'Prénom', 1, 80); const lastName = textField(input.lastName, 'Nom', 1, 80);
   const phone = normalizePhone(input.phone); const email = customerEmail(input.email); const password = customerPassword(input.password);
   limit(`customer-register-ip:${clientIp(req)}`, 10, 60 * 60_000);
-  const client = await pool.connect(); const userId = randomUUID(); const customerId = randomUUID();
+  const claimToken = typeof input.claimToken === 'string' ? input.claimToken : ''; const client = await pool.connect(); const userId = randomUUID(); let customerId = randomUUID();
   try { await client.query('BEGIN');
-    const conflict = await client.query(`SELECT u.id FROM users u LEFT JOIN customers c ON c.user_id=u.id WHERE u.status='active' AND (u.phone_e164=$1 OR lower(c.email)=lower($2)) FOR UPDATE`, [phone,email]);
+    const conflict = await client.query(`SELECT u.id FROM users u LEFT JOIN customers c ON c.user_id=u.id WHERE u.status='active' AND (u.phone_e164=$1 OR lower(c.email)=lower($2)) FOR UPDATE OF u`, [phone,email]);
     if (conflict.rowCount) throw new HttpError(409, 'Ces coordonnées sont déjà associées à un autre compte. Contactez l’atelier pour obtenir de l’aide.');
+    let claimId: string | null = null;
+    if (claimToken) {
+      const claimHash = createHmac('sha256', accessSecret).update(`booking:${claimToken}`).digest('hex');
+      const claim = await client.query(`SELECT bc.id,bc.customer_id,c.user_id FROM booking_claims bc JOIN customers c ON c.id=bc.customer_id JOIN tickets t ON t.id=bc.ticket_id WHERE bc.token_hash=$1 AND bc.expires_at>now() AND bc.consumed_at IS NULL FOR UPDATE`, [claimHash]);
+      if (!claim.rowCount) throw new HttpError(409, 'Cette demande ne peut plus être rattachée automatiquement à un compte. Contactez l’atelier si vous avez besoin d’aide.');
+      if (claim.rows[0].user_id) throw new HttpError(409, 'Cette demande a déjà été associée à un espace MMS.');
+      claimId = claim.rows[0].id; customerId = claim.rows[0].customer_id;
+    }
     const digest = await hashPassword(password);
     await client.query(`INSERT INTO users(id,phone_e164,role,phone_verification_status,email_verified_at) VALUES($1,$2,'customer','unverified',NULL)`,[userId,phone]);
-    await client.query(`INSERT INTO customers(id,user_id,name,phone,email,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version) VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,now(),$9)`,[customerId,userId,`${firstName} ${lastName}`,phone,email,firstName,lastName,termsVersion,privacyVersion]);
+    if (claimId) await client.query(`UPDATE customers SET user_id=$2 WHERE id=$1`, [customerId,userId]);
+    else await client.query(`INSERT INTO customers(id,user_id,name,phone,email,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version) VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,now(),$9)`,[customerId,userId,`${firstName} ${lastName}`,phone,email,firstName,lastName,termsVersion,privacyVersion]);
     await client.query(`INSERT INTO customer_credentials(user_id,password_hash,password_changed_at) VALUES($1,$2,now())`,[userId,digest]);
+    if (claimId) await client.query(`UPDATE booking_claims SET consumed_at=now() WHERE id=$1`, [claimId]);
     await client.query('COMMIT'); return issueSession(userId,customerId,req,res);
   } catch(error) { await client.query('ROLLBACK').catch(()=>undefined); if ((error as {code?:string}).code==='23505') throw new HttpError(409,'Ces coordonnées sont déjà associées à un autre compte. Contactez l’atelier pour obtenir de l’aide.'); throw error; } finally { client.release(); }
+}
+async function claimBooking(auth: Identity, input: Record<string, unknown>) {
+  const token = typeof input.claimToken === 'string' ? input.claimToken : '';
+  if (!token || token.length > 256) throw new HttpError(400, 'Jeton de rattachement invalide.');
+  const hash = createHmac('sha256', accessSecret).update(`booking:${token}`).digest('hex'); const client = await pool.connect();
+  try { await client.query('BEGIN');
+    const claim = await client.query(`SELECT bc.id,bc.customer_id,bc.ticket_id,bc.consumed_at,bc.expires_at,c.user_id FROM booking_claims bc JOIN customers c ON c.id=bc.customer_id JOIN tickets t ON t.id=bc.ticket_id WHERE bc.token_hash=$1 FOR UPDATE`, [hash]);
+    if (!claim.rowCount) throw new HttpError(400, 'Jeton de rattachement invalide.');
+    const row = claim.rows[0];
+    if (row.consumed_at) throw new HttpError(409, 'Cette demande a déjà été associée à un espace MMS.');
+    if (new Date(row.expires_at) <= new Date()) throw new HttpError(409, 'Cette demande ne peut plus être rattachée automatiquement à un compte. Contactez l’atelier si vous avez besoin d’aide.');
+    if (row.user_id && row.user_id !== auth.userId) { console.warn('booking claim ownership anomaly', { claimId: row.id }); throw new HttpError(409, 'Cette demande a déjà été associée à un espace MMS.'); }
+    if (!row.user_id) {
+      // The authenticated account already owns its customer profile: move only
+      // the claimed booking graph, never any similarly named historical data.
+      await client.query('UPDATE vehicles SET customer_id=$2 WHERE customer_id=$1', [row.customer_id,auth.customerId]);
+      await client.query('UPDATE appointments SET customer_id=$2 WHERE customer_id=$1', [row.customer_id,auth.customerId]);
+      await client.query('UPDATE tickets SET customer_id=$2 WHERE id=$1', [row.ticket_id,auth.customerId]);
+    }
+    await client.query('UPDATE booking_claims SET consumed_at=now() WHERE id=$1', [row.id]); await client.query('COMMIT');
+    return customerData(auth.customerId);
+  } catch (error) { await client.query('ROLLBACK').catch(()=>undefined); throw error; } finally { client.release(); }
 }
 async function customerPasswordLogin(req: IncomingMessage, input: Record<string, unknown>, res: ServerResponse) {
   const identifier = textField(input.identifier,'Identifiant',3,254); const password = typeof input.password === 'string' ? input.password : '';
@@ -814,6 +846,9 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       const result = await pool.query(`SELECT t.id,t.reference,t.appointment_id AS "appointmentId",t.vehicle_id AS "vehicleId",t.intervention_type AS "interventionType",t.description,t.status,t.created_at AS "createdAt",a.appointment_date AS "appointmentDate",a.appointment_time AS "appointmentTime" FROM tickets t LEFT JOIN appointments a ON a.id=t.appointment_id WHERE t.id=$1`, [ticketId]);
       return send(res, 201, { ticket: result.rows[0], appointmentId, bookingClaim: claim });
     } catch (error) { await client.query('ROLLBACK').catch(() => undefined); if ((error as {code?: string}).code === '23505') throw new HttpError(409, 'Ce créneau vient d’être réservé. Choisissez-en un autre.'); throw error; } finally { client.release(); }
+  }
+  if (method === 'POST' && parts[1] === 'bookings' && parts[2] === 'claim' && parts.length === 3) {
+    const auth = await identity(req); return send(res, 200, await claimBooking(auth, await body(req)));
   }
   if (parts[1] === 'customers' && parts[2]) {
     const customerId = uuid(parts[2]);

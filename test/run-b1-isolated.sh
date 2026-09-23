@@ -19,4 +19,4 @@ $compose up -d --build --wait
 export MMS_API_URL="${MMS_API_URL:-http://127.0.0.1:3001}"
 export MMS_API_CONTAINER="${MMS_API_CONTAINER:-mms-b1-test-api-1}"
 export MMS_TEST_DB_CONTAINER="${MMS_TEST_DB_CONTAINER:-mms-b1-test-db-1}"
-node --test test/auth.integration.test.mjs test/staff-tickets.integration.test.mjs test/anonymous-booking.integration.test.mjs
+node --test test/auth.integration.test.mjs test/staff-tickets.integration.test.mjs test/anonymous-booking.integration.test.mjs test/booking-claim.activation.test.mjs
