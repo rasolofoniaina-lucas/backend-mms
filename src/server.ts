@@ -50,7 +50,7 @@ function clientIp(req: IncomingMessage) {
   // untrusted inbound XFF. Direct access to port 8080 remains loopback-only.
   const peer = req.socket.remoteAddress || 'unknown';
   const real = req.headers['x-real-ip'];
-  return trustedNginxPeers.has(peer) && typeof real === 'string' && isIP(real) ? real : peer;
+  return (testMode || trustedNginxPeers.has(peer)) && typeof real === 'string' && isIP(real) ? real : peer;
 }
 function normalizePhone(value: unknown) {
   const raw = textField(value, 'Numéro de téléphone', 6, 40);
@@ -66,6 +66,16 @@ function isYasPhone(phone: string) {
 function pin(value: unknown) {
   if (typeof value !== 'string' || !/^\d{6}$/.test(value)) throw new HttpError(400, 'Le code PIN doit contenir exactement six chiffres.');
   return value;
+}
+function customerPassword(value: unknown) {
+  if (typeof value !== 'string' || value.length < 8 || value.length > 128) throw new HttpError(400, 'Le mot de passe doit contenir au moins 8 caractères.');
+  return value;
+}
+function customerEmail(value: unknown) {
+  if (typeof value !== 'string') throw new HttpError(400, 'Adresse e-mail invalide.');
+  const email = value.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) throw new HttpError(400, 'Adresse e-mail invalide.');
+  return email;
 }
 const pinSecret = (value: string) => `${value}:${customerPinPepper}`;
 function otpDigest(challengeId: string, code: string) { return createHmac('sha256', otpPepper).update(`${challengeId}:${code}`).digest('hex'); }
@@ -384,6 +394,33 @@ async function createYasCustomer(req: IncomingMessage, input: Record<string, unk
     return issueSession(userId, customerId, req, res);
   } catch (error) { await client.query('ROLLBACK').catch(() => undefined); if ((error as {code?:string}).code==='23505') throw new HttpError(409,'Un compte existe déjà avec ce numéro.'); throw error; } finally { client.release(); }
 }
+async function registerCustomerPassword(req: IncomingMessage, input: Record<string, unknown>, res: ServerResponse) {
+  const firstName = textField(input.firstName, 'Prénom', 1, 80); const lastName = textField(input.lastName, 'Nom', 1, 80);
+  const phone = normalizePhone(input.phone); const email = customerEmail(input.email); const password = customerPassword(input.password);
+  limit(`customer-register-ip:${clientIp(req)}`, 10, 60 * 60_000);
+  const client = await pool.connect(); const userId = randomUUID(); const customerId = randomUUID();
+  try { await client.query('BEGIN');
+    const conflict = await client.query(`SELECT u.id FROM users u LEFT JOIN customers c ON c.user_id=u.id WHERE u.status='active' AND (u.phone_e164=$1 OR lower(c.email)=lower($2)) FOR UPDATE`, [phone,email]);
+    if (conflict.rowCount) throw new HttpError(409, 'Ces coordonnées sont déjà associées à un autre compte. Contactez l’atelier pour obtenir de l’aide.');
+    const digest = await hashPassword(password);
+    await client.query(`INSERT INTO users(id,phone_e164,role,phone_verification_status,email_verified_at) VALUES($1,$2,'customer','unverified',NULL)`,[userId,phone]);
+    await client.query(`INSERT INTO customers(id,user_id,name,phone,email,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version) VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,now(),$9)`,[customerId,userId,`${firstName} ${lastName}`,phone,email,firstName,lastName,termsVersion,privacyVersion]);
+    await client.query(`INSERT INTO customer_credentials(user_id,password_hash,password_changed_at) VALUES($1,$2,now())`,[userId,digest]);
+    await client.query('COMMIT'); return issueSession(userId,customerId,req,res);
+  } catch(error) { await client.query('ROLLBACK').catch(()=>undefined); if ((error as {code?:string}).code==='23505') throw new HttpError(409,'Ces coordonnées sont déjà associées à un autre compte. Contactez l’atelier pour obtenir de l’aide.'); throw error; } finally { client.release(); }
+}
+async function customerPasswordLogin(req: IncomingMessage, input: Record<string, unknown>, res: ServerResponse) {
+  const identifier = textField(input.identifier,'Identifiant',3,254); const password = typeof input.password === 'string' ? input.password : '';
+  let phone: string | null = null; let email: string | null = null;
+  if (identifier.includes('@')) email = customerEmail(identifier); else phone = normalizePhone(identifier);
+  limit(`customer-password-login-ip:${clientIp(req)}`,20,15*60_000); limit(`customer-password-login-id:${(email||phone)!}`,8,15*60_000);
+  const generic = new HttpError(401,'Identifiant ou mot de passe incorrect.');
+  const found = await pool.query(`SELECT u.id AS user_id,c.id AS customer_id,cc.password_hash,cc.must_change_password,cc.temporary_password_expires_at FROM users u JOIN customers c ON c.user_id=u.id JOIN customer_credentials cc ON cc.user_id=u.id WHERE u.status='active' AND (($1::text IS NOT NULL AND lower(c.email)=lower($1)) OR ($2::text IS NOT NULL AND u.phone_e164=$2))`,[email,phone]);
+  if (!found.rowCount || !await verifyPassword(found.rows[0].password_hash,password)) throw generic;
+  if (found.rows[0].temporary_password_expires_at && new Date(found.rows[0].temporary_password_expires_at) < new Date()) throw generic;
+  const session = await issueSession(found.rows[0].user_id,found.rows[0].customer_id,req,res);
+  return { ...session, mustChangePassword: Boolean(found.rows[0].must_change_password) };
+}
 
 async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: string[], method: string, path: URL) {
   if (method === 'POST' && parts[2] === 'login' && parts.length === 3) {
@@ -698,6 +735,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   if (parts[1] === 'staff') return staffRoute(req, res, parts, method, path);
   if (parts[1] === 'admin') return adminRoute(req, res, parts, method, path);
   if (parts[1] === 'auth') {
+    if (method === 'POST' && parts[2] === 'customer-register' && parts.length === 3) return send(res, 201, await registerCustomerPassword(req, await body(req), res));
+    if (method === 'POST' && parts[2] === 'customer-login' && parts.length === 3) return send(res, 200, await customerPasswordLogin(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'pin-login' && parts.length === 3) return send(res, 200, await customerPinLogin(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'yas-register' && parts.length === 3) return send(res, 201, await createYasCustomer(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'register' && parts[3] === 'request-otp') return send(res, 200, await createChallenge(req, await body(req), 'register'));
@@ -733,7 +772,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     return send(res, 200, await availabilityFor(date));
   }
   if (method === 'POST' && parts[1] === 'bookings' && parts[2] === 'complete' && parts.length === 3) {
-    const auth = await identity(req); const input = await body(req);
+    let auth: Identity | null = null; try { auth = await identity(req); } catch (error) { if (!(error instanceof HttpError) || error.status !== 401) throw error; }
+    const input = await body(req);
     const kind = input.kind === 'Urgence' ? 'Urgence' : scheduledKind(input.kind);
     const problem = textField(input.problem, 'Description du problème', 10, 2000);
     const vehicle = vehicleInput((input.vehicle && typeof input.vehicle === 'object' ? input.vehicle : {}) as Record<string, unknown>);
@@ -743,29 +783,36 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (date && (!datePattern.test(date) || Number.isNaN(Date.parse(`${date}T12:00:00`)))) throw new HttpError(400, 'Date invalide.');
     if (time && !/^\d{2}:\d{2}$/.test(time)) throw new HttpError(400, 'Créneau invalide.');
     const contactPhone = input.contactPhone ? normalizePhone(input.contactPhone) : null;
+    const firstName = auth ? '' : textField(input.firstName, 'Prénom', 1, 80); const lastName = auth ? '' : textField(input.lastName, 'Nom', 1, 80); const email = auth ? null : customerEmail(input.email);
+    if (!auth && !contactPhone) throw new HttpError(400, 'Téléphone requis.');
+    limit(`anonymous-booking-ip:${clientIp(req)}`, 5, 60 * 60_000); if (!auth) { limit(`anonymous-booking-phone:${contactPhone}`, 3, 24 * 60 * 60_000); limit(`anonymous-booking-email:${email}`, 3, 24 * 60 * 60_000); }
     const immobilized = typeof input.immobilized === 'boolean' ? input.immobilized : null;
     if (kind === 'Urgence' && (contactPhone === null || immobilized === null)) throw new HttpError(400, 'Complétez les informations de dépannage.');
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const customerId = auth?.customerId || randomUUID();
+      if (!auth) await client.query(`INSERT INTO customers(id,name,phone,email,first_name,last_name) VALUES($1,$2,$3,$4,$5,$6)`, [customerId,`${firstName} ${lastName}`,contactPhone,email,firstName,lastName]);
       const vehicleId = randomUUID();
-      await client.query(`INSERT INTO vehicles(id,customer_id,name,model,plate,color,displacement_cc,production_year) VALUES($1,$2,$3,$4,$5,'#dce8ef',$6,$7)`, [vehicleId,auth.customerId,vehicle.name,vehicle.model,vehicle.plate,vehicle.displacementCc,vehicle.year]);
+      await client.query(`INSERT INTO vehicles(id,customer_id,name,model,plate,color,displacement_cc,production_year) VALUES($1,$2,$3,$4,$5,'#dce8ef',$6,$7)`, [vehicleId,customerId,vehicle.name,vehicle.model,vehicle.plate,vehicle.displacementCc,vehicle.year]);
       let appointmentId: string | null = null;
       if (kind !== 'Urgence') {
         const available = await availabilityFor(date!, client);
         if (!available.slots.includes(time!) || available.occupied.includes(time!)) throw new HttpError(409, 'Ce créneau vient d’être réservé. Choisissez-en un autre.');
         appointmentId = randomUUID();
         await client.query(`INSERT INTO appointments(id,customer_id,vehicle_id,problem,kind,address,appointment_date,appointment_time,status,contact_phone,immobilized)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,'Confirmé',$9,$10)`, [appointmentId,auth.customerId,vehicleId,problem,kind,address,date,time,contactPhone,immobilized]);
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,'Confirmé',$9,$10)`, [appointmentId,customerId,vehicleId,problem,kind,address,date,time,contactPhone,immobilized]);
       }
       const ticketId = randomUUID(); const sequence = await client.query(`SELECT nextval('ticket_reference_seq') AS value`);
       const reference = ticketReference(String(sequence.rows[0].value));
       await client.query(`INSERT INTO tickets(id,reference,customer_id,vehicle_id,appointment_id,intervention_type,description,status,created_by_user_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,'new',$8)`, [ticketId,reference,auth.customerId,vehicleId,appointmentId,kind,problem,auth.userId]);
-      await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,new_value) VALUES($1,$2,'ticket_created','new')`, [ticketId,auth.userId]);
+        VALUES($1,$2,$3,$4,$5,$6,$7,'new',$8)`, [ticketId,reference,customerId,vehicleId,appointmentId,kind,problem,auth?.userId || null]);
+      await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,new_value) VALUES($1,$2,'ticket_created','new')`, [ticketId,auth?.userId || null]);
+      const claim = randomBytes(32).toString('base64url'); const claimHash = createHmac('sha256', accessSecret).update(`booking:${claim}`).digest('hex');
+      await client.query(`INSERT INTO booking_claims(id,customer_id,ticket_id,token_hash,expires_at) VALUES($1,$2,$3,$4,now()+interval '24 hours')`,[randomUUID(),customerId,ticketId,claimHash]);
       await client.query('COMMIT');
       const result = await pool.query(`SELECT t.id,t.reference,t.appointment_id AS "appointmentId",t.vehicle_id AS "vehicleId",t.intervention_type AS "interventionType",t.description,t.status,t.created_at AS "createdAt",a.appointment_date AS "appointmentDate",a.appointment_time AS "appointmentTime" FROM tickets t LEFT JOIN appointments a ON a.id=t.appointment_id WHERE t.id=$1`, [ticketId]);
-      return send(res, 201, { ticket: result.rows[0], appointmentId });
+      return send(res, 201, { ticket: result.rows[0], appointmentId, bookingClaim: claim });
     } catch (error) { await client.query('ROLLBACK').catch(() => undefined); if ((error as {code?: string}).code === '23505') throw new HttpError(409, 'Ce créneau vient d’être réservé. Choisissez-en un autre.'); throw error; } finally { client.release(); }
   }
   if (parts[1] === 'customers' && parts[2]) {

@@ -9,7 +9,8 @@
     "dev": "tsx watch src/server.ts",
     "test:unit": "node --import tsx --test test/sms-provider.test.mjs test/phone-normalization.test.mjs test/staff-domain.test.mjs",
     "test:integration": "node --test test/auth.integration.test.mjs",
-    "test:staff-integration": "node --test test/staff-tickets.integration.test.mjs"
+    "test:staff-integration": "node --test test/staff-tickets.integration.test.mjs",
+    "test:b1": "sh test/run-b1-isolated.sh"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.2.1",

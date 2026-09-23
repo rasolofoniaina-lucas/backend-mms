@@ -26,6 +26,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at timestamptz;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
 ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('customer', 'mechanic', 'workshop_manager', 'admin'));
 -- Phase A installations had staff passwords on users. Give those development
@@ -46,7 +47,7 @@ UPDATE users SET phone_verification_status=CASE WHEN phone_verified_at IS NOT NU
 WHERE phone_verification_status='unverified' AND phone_verified_at IS NOT NULL;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_identity_shape_check;
 ALTER TABLE users ADD CONSTRAINT users_identity_shape_check CHECK (
-  (role='customer' AND phone_e164 IS NOT NULL AND username IS NULL AND email IS NULL)
+  (role='customer' AND phone_e164 IS NOT NULL AND username IS NULL)
   OR (role IN ('mechanic','workshop_manager','admin') AND phone_e164 IS NULL
       AND username IS NOT NULL AND username ~ '^[a-z][a-z0-9._-]{2,31}$')
 );
@@ -93,6 +94,39 @@ ALTER TABLE customers ADD COLUMN IF NOT EXISTS terms_accepted_at timestamptz;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS terms_version text;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS privacy_accepted_at timestamptz;
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS privacy_version text;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS email text;
+-- Anonymous bookings must never merge customer histories merely because a phone
+-- number or email matches. Account uniqueness is enforced on users at signup.
+DROP INDEX IF EXISTS customers_email_unique;
+CREATE INDEX IF NOT EXISTS customers_email_lookup_idx ON customers(lower(email)) WHERE email IS NOT NULL;
+
+-- Client password credentials are deliberately separate from staff local_credentials.
+CREATE TABLE IF NOT EXISTS customer_credentials (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  password_hash text NOT NULL,
+  must_change_password boolean NOT NULL DEFAULT false,
+  temporary_password_expires_at timestamptz,
+  password_changed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS booking_claims (
+  id uuid PRIMARY KEY,
+  customer_id uuid NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  token_hash text NOT NULL UNIQUE,
+  expires_at timestamptz NOT NULL,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS customer_access_requests (
+  id uuid PRIMARY KEY,
+  customer_id uuid REFERENCES customers(id) ON DELETE SET NULL,
+  identifier_masked text NOT NULL,
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz,
+  resolved_by_user_id uuid REFERENCES users(id)
+);
 CREATE UNIQUE INDEX IF NOT EXISTS customers_user_unique ON customers(user_id) WHERE user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS otp_challenges (
@@ -271,6 +305,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS tickets_customer_idx ON tickets(customer_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS tickets_mechanic_idx ON tickets(assigned_mechanic_user_id, status, created_at DESC);
+ALTER TABLE booking_claims ADD COLUMN IF NOT EXISTS ticket_id uuid REFERENCES tickets(id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS ticket_events (
   id bigserial PRIMARY KEY,
@@ -290,6 +325,8 @@ CREATE TABLE IF NOT EXISTS admin_audit_events (
   action text NOT NULL CHECK (action IN ('admin_created_user','admin_disabled_user','admin_enabled_user','admin_reset_password','admin_changed_role')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE admin_audit_events DROP CONSTRAINT IF EXISTS admin_audit_events_action_check;
+ALTER TABLE admin_audit_events ADD CONSTRAINT admin_audit_events_action_check CHECK (action IN ('admin_created_user','admin_disabled_user','admin_enabled_user','admin_reset_password','admin_changed_role','customer_password_reset'));
 CREATE INDEX IF NOT EXISTS admin_audit_actor_idx ON admin_audit_events(actor_user_id, created_at DESC);
 
 CREATE OR REPLACE FUNCTION reject_mms_audit_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
