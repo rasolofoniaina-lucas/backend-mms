@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS customer_access_requests (
   resolved_at timestamptz,
   resolved_by_user_id uuid REFERENCES users(id)
 );
+ALTER TABLE customer_access_requests ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE customer_access_requests ADD COLUMN IF NOT EXISTS identifier_type text;
+ALTER TABLE customer_access_requests ADD COLUMN IF NOT EXISTS identifier_normalized text;
+ALTER TABLE customer_access_requests ADD COLUMN IF NOT EXISTS type text NOT NULL DEFAULT 'password_reset';
+ALTER TABLE customer_access_requests ADD COLUMN IF NOT EXISTS resolved_by_user_id uuid REFERENCES users(id);
+ALTER TABLE customer_access_requests ALTER COLUMN status SET DEFAULT 'pending';
+ALTER TABLE customer_access_requests DROP CONSTRAINT IF EXISTS customer_access_requests_status_check;
+UPDATE customer_access_requests SET status='pending' WHERE status='open';
+ALTER TABLE customer_access_requests DROP CONSTRAINT IF EXISTS customer_access_requests_type_check;
+ALTER TABLE customer_access_requests ADD CONSTRAINT customer_access_requests_type_check CHECK (type IN ('password_reset'));
+ALTER TABLE customer_access_requests ADD CONSTRAINT customer_access_requests_status_check CHECK (status IN ('pending','resolved','cancelled'));
+CREATE INDEX IF NOT EXISTS customer_access_requests_pending_identifier_idx ON customer_access_requests(identifier_normalized,created_at DESC) WHERE status='pending';
+CREATE UNIQUE INDEX IF NOT EXISTS customer_access_requests_one_pending_identifier ON customer_access_requests(identifier_normalized) WHERE status='pending' AND identifier_normalized IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS customers_user_unique ON customers(user_id) WHERE user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS otp_challenges (

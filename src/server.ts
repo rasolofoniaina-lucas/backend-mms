@@ -453,6 +453,16 @@ async function customerPasswordLogin(req: IncomingMessage, input: Record<string,
   const session = await issueSession(found.rows[0].user_id,found.rows[0].customer_id,req,res);
   return { ...session, mustChangePassword: Boolean(found.rows[0].must_change_password) };
 }
+async function createRecoveryRequest(req: IncomingMessage, input: Record<string, unknown>) {
+  const identifier = textField(input.identifier, 'Identifiant', 3, 254); let normalized: string; let type: 'email'|'phone';
+  if (identifier.includes('@')) { normalized = customerEmail(identifier); type = 'email'; } else { normalized = normalizePhone(identifier); type = 'phone'; }
+  try { limit(`recovery-ip:${clientIp(req)}`,5,60*60_000); limit(`recovery-identifier:${normalized}`,3,24*60*60_000); }
+  catch (error) { if (error instanceof HttpError && error.status === 429) throw new HttpError(429, 'Trop de demandes ont été effectuées. Réessayez plus tard.'); throw error; }
+  const found = await pool.query(`SELECT u.id AS user_id,c.id AS customer_id FROM users u JOIN customers c ON c.user_id=u.id WHERE u.status='active' AND (${type === 'email' ? 'lower(c.email)=lower($1)' : 'u.phone_e164=$1'}) LIMIT 1`, [normalized]);
+  await pool.query(`INSERT INTO customer_access_requests(id,user_id,customer_id,identifier_type,identifier_normalized,type,status,identifier_masked) VALUES($1,$2,$3,$4,$5,'password_reset','pending',$6) ON CONFLICT DO NOTHING`, [randomUUID(),found.rows[0]?.user_id||null,found.rows[0]?.customer_id||null,type,normalized,maskIdentifier(normalized,type)]);
+  return { message: 'Votre demande a bien été prise en compte. Si un espace MMS correspond à ces informations, notre équipe pourra vous contacter.' };
+}
+function maskIdentifier(value: string, type: string) { return type === 'email' ? `${value.slice(0,2)}***@${value.split('@')[1]}` : `0${value.slice(4,6)} ** *** **`; }
 
 async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: string[], method: string, path: URL) {
   if (method === 'POST' && parts[2] === 'login' && parts.length === 3) {
@@ -469,6 +479,11 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       WHERE lower(ui.provider_subject)=lower($1) AND lower(u.username)=lower($1) AND u.status='active'`, [username]);
     if (!found.rowCount || !isStaffRole(found.rows[0].role) || !found.rows[0].password_hash || !await verifyPassword(found.rows[0].password_hash, password)) throw generic;
     return send(res, 200, await issueSession(found.rows[0].id, '', req, res, found.rows[0].role));
+  }
+  if (method === 'GET' && parts[2] === 'access-requests' && parts.length === 3) {
+    await requireRole(req, ['workshop_manager','admin']);
+    const rows = await pool.query(`SELECT r.id,r.status,r.created_at AS "createdAt",CASE WHEN r.identifier_type='email' THEN r.identifier_masked ELSE NULL END AS "emailMasked",CASE WHEN r.identifier_type='phone' THEN r.identifier_masked ELSE NULL END AS "phoneMasked",CASE WHEN c.id IS NULL THEN NULL ELSE COALESCE(NULLIF(concat_ws(' ',c.first_name,c.last_name),''),c.name) END AS customer FROM customer_access_requests r LEFT JOIN customers c ON c.id=r.customer_id WHERE r.status='pending' AND r.type='password_reset' ORDER BY r.created_at DESC`);
+    return send(res,200,rows.rows);
   }
   const auth = await requireRole(req, allStaffRoles, ['me','change-password','logout-all'].includes(parts[2]));
   if (method === 'GET' && parts[2] === 'me' && parts.length === 3) {
@@ -767,6 +782,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   if (parts[1] === 'staff') return staffRoute(req, res, parts, method, path);
   if (parts[1] === 'admin') return adminRoute(req, res, parts, method, path);
   if (parts[1] === 'auth') {
+    if (method === 'POST' && parts[2] === 'recovery-request' && parts.length === 3) return send(res, 200, await createRecoveryRequest(req, await body(req)));
     if (method === 'POST' && parts[2] === 'customer-register' && parts.length === 3) return send(res, 201, await registerCustomerPassword(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'customer-login' && parts.length === 3) return send(res, 200, await customerPasswordLogin(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'pin-login' && parts.length === 3) return send(res, 200, await customerPinLogin(req, await body(req), res));

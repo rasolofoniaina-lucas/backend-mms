@@ -89,6 +89,21 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
   const client = await api('/auth/register/verify-otp', { method: 'POST', body: { challengeId: request.data.challengeId, code: otp(request.data.challengeId) } });
   assert.equal(client.status, 201);
   const clientId = client.data.user.user.id;
+  await t.test('demandes de récupération : lecture admin/chef et isolation des autres rôles', async () => {
+    const created = await api('/auth/recovery-request', { method: 'POST', body: { identifier: phone } });
+    assert.equal(created.status, 200);
+    const adminList = await api('/staff/access-requests', { token: admin.data.accessToken });
+    const managerList = await api('/staff/access-requests', { token: chef.data.accessToken });
+    assert.equal(adminList.status, 200); assert.equal(managerList.status, 200);
+    const entry = adminList.data.find(item => item.phoneMasked === '037 ** *** **');
+    assert.ok(entry); assert.equal(entry.status, 'pending'); assert.equal(entry.customer, 'Client Recette');
+    assert.deepEqual(Object.keys(entry).sort(), ['createdAt','customer','emailMasked','id','phoneMasked','status'].sort());
+    assert.equal(entry.emailMasked, null); assert.equal(JSON.stringify(adminList.data).includes(phone), false);
+    assert.deepEqual(managerList.data, adminList.data);
+    assert.equal((await api('/staff/access-requests', { token: mecaA.data.accessToken })).status, 403);
+    assert.equal((await api('/staff/access-requests', { token: client.data.accessToken })).status, 403);
+    assert.equal((await api('/staff/access-requests')).status, 401);
+  });
   const vehicle = await api(`/customers/${clientId}/vehicles`, { method: 'POST', token: client.data.accessToken, body: { name: 'Yamaha', model: 'YZ250F', displacementCc: 250, year: 2024, plate: '' } });
   assert.equal(vehicle.status, 201);
   const appointment = await api(`/customers/${clientId}/appointments`, { method: 'POST', token: client.data.accessToken, body: { vehicleId: vehicle.data.id, problem: 'Panne moteur pour la recette Phase A', diagnosis: '', kind: 'Urgence', address: 'Atelier de recette local', contactPhone: phone, immobilized: true } });
