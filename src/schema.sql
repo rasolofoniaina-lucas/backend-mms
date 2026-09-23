@@ -37,6 +37,13 @@ WHERE role IN ('mechanic','workshop_manager','admin');
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique ON users (lower(username)) WHERE username IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (lower(email)) WHERE email IS NOT NULL;
 CREATE INDEX IF NOT EXISTS users_role_status_idx ON users(role, status);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verification_status text NOT NULL DEFAULT 'unverified';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_method text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_by_user_id uuid REFERENCES users(id);
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_phone_verification_status_check;
+ALTER TABLE users ADD CONSTRAINT users_phone_verification_status_check CHECK (phone_verification_status IN ('unverified','pending_manual','verified_otp','verified_manual'));
+UPDATE users SET phone_verification_status=CASE WHEN phone_verified_at IS NOT NULL THEN 'verified_otp' ELSE 'unverified' END
+WHERE phone_verification_status='unverified' AND phone_verified_at IS NOT NULL;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_identity_shape_check;
 ALTER TABLE users ADD CONSTRAINT users_identity_shape_check CHECK (
   (role='customer' AND phone_e164 IS NOT NULL AND username IS NULL AND email IS NULL)
@@ -119,6 +126,60 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 );
 CREATE INDEX IF NOT EXISTS user_sessions_user_idx ON user_sessions(user_id, expires_at DESC);
 
+-- Customer PINs are intentionally separate from staff credentials.  The hash
+-- is Argon2id and is calculated from PIN + server-side CUSTOMER_PIN_PEPPER.
+CREATE TABLE IF NOT EXISTS customer_pin_credentials (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  pin_hash text NOT NULL,
+  failed_attempts integer NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+  locked_until timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS booking_settings (
+  id boolean PRIMARY KEY DEFAULT true CHECK (id),
+  timezone text NOT NULL DEFAULT 'Indian/Antananarivo',
+  slot_minutes integer NOT NULL DEFAULT 60 CHECK (slot_minutes=60),
+  capacity integer NOT NULL DEFAULT 1 CHECK (capacity=1)
+);
+INSERT INTO booking_settings(id) VALUES(true) ON CONFLICT (id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS workshop_schedule_rules (
+  weekday smallint PRIMARY KEY CHECK (weekday BETWEEN 0 AND 6),
+  opens_at time,
+  closes_at time,
+  is_open boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO workshop_schedule_rules(weekday,opens_at,closes_at,is_open) VALUES
+ (0,NULL,NULL,false),(1,'08:00','17:00',true),(2,'08:00','17:00',true),(3,'08:00','17:00',true),(4,'08:00','17:00',true),(5,'08:00','17:00',true),(6,'08:00','13:00',true)
+ON CONFLICT (weekday) DO NOTHING;
+CREATE TABLE IF NOT EXISTS workshop_schedule_exceptions (
+  day date PRIMARY KEY,
+  opens_at time,
+  closes_at time,
+  is_open boolean NOT NULL,
+  reason text NOT NULL DEFAULT '',
+  created_by_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS blocked_slots (
+  id uuid PRIMARY KEY,
+  slot_date date NOT NULL,
+  slot_time time NOT NULL,
+  reason text NOT NULL DEFAULT '',
+  created_by_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(slot_date,slot_time)
+);
+CREATE TABLE IF NOT EXISTS customer_verification_events (
+  id bigserial PRIMARY KEY,
+  customer_id uuid NOT NULL REFERENCES customers(id),
+  actor_user_id uuid REFERENCES users(id),
+  action text NOT NULL CHECK (action IN ('phone_verified_manual','pin_reset')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS phone_change_challenges (
   customer_id uuid PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
   challenge_id uuid NOT NULL,
@@ -166,7 +227,8 @@ CREATE TABLE IF NOT EXISTS appointments (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS unique_active_slot ON appointments(kind, appointment_date, appointment_time)
+DROP INDEX IF EXISTS unique_active_slot;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_active_slot ON appointments(appointment_date, appointment_time)
   WHERE kind <> 'Urgence' AND status IN ('Confirmé', 'Pris en charge', 'En cours');
 
 CREATE INDEX IF NOT EXISTS appointments_customer_idx ON appointments(customer_id, appointment_date DESC);

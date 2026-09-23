@@ -11,8 +11,10 @@ import { canTransition, hashPassword, isStaffRole, staffEmail, staffUsername, te
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
 if (!process.env.OTP_PEPPER || !process.env.ACCESS_TOKEN_SECRET) throw new Error('OTP_PEPPER et ACCESS_TOKEN_SECRET sont requis.');
+if (!process.env.CUSTOMER_PIN_PEPPER) throw new Error('CUSTOMER_PIN_PEPPER est requis.');
 const otpPepper = process.env.OTP_PEPPER;
 const accessSecret = process.env.ACCESS_TOKEN_SECRET;
+const customerPinPepper = process.env.CUSTOMER_PIN_PEPPER;
 const testMode = process.env.MMS_TEST_MODE === '1';
 const smsProvider = createSmsProvider(process.env);
 const cookieSecure = process.env.COOKIE_SECURE === '1' || process.env.NODE_ENV === 'production';
@@ -22,11 +24,6 @@ const privacyVersion = process.env.PRIVACY_VERSION || '1.0';
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
 pool.on('error', error => console.error('Connexion PostgreSQL interrompue', error));
 
-const slots = {
-  'À domicile': ['08:30', '10:00', '11:30', '14:00', '16:00'],
-  'En atelier': ['09:00', '10:30', '13:30', '15:00', '16:30'],
-} as const;
-type ScheduledKind = keyof typeof slots;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
 const maxPhotoBytes = 5 * 1024 * 1024;
@@ -61,6 +58,16 @@ function normalizePhone(value: unknown) {
   if (!phone) throw new HttpError(400, 'Entrez un numéro de téléphone malgache valide.');
   return phone;
 }
+function isYasPhone(phone: string) {
+  // Centralised until a commercial numbering configuration is supplied.
+  const prefixes = (process.env.YAS_PHONE_PREFIXES || '+26134').split(',').map(value => value.trim()).filter(Boolean);
+  return prefixes.some(prefix => phone.startsWith(prefix));
+}
+function pin(value: unknown) {
+  if (typeof value !== 'string' || !/^\d{6}$/.test(value)) throw new HttpError(400, 'Le code PIN doit contenir exactement six chiffres.');
+  return value;
+}
+const pinSecret = (value: string) => `${value}:${customerPinPepper}`;
 function otpDigest(challengeId: string, code: string) { return createHmac('sha256', otpPepper).update(`${challengeId}:${code}`).digest('hex'); }
 function safeEqualHex(left: string, right: string) { const a = Buffer.from(left, 'hex'); const b = Buffer.from(right, 'hex'); return a.length === b.length && timingSafeEqual(a, b); }
 function base64url(value: string | Buffer) { return Buffer.from(value).toString('base64url'); }
@@ -199,6 +206,29 @@ function localDate(now: Date) {
 function localTime(now: Date) {
   return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 }
+function weekdayFor(date: string) { return new Date(`${date}T12:00:00Z`).getUTCDay(); }
+function slotRange(opens: string, closes: string) {
+  const [oh, om] = opens.slice(0, 5).split(':').map(Number); const [ch, cm] = closes.slice(0, 5).split(':').map(Number);
+  const start = oh * 60 + om; const end = ch * 60 + cm; const values: string[] = [];
+  for (let minute = start; minute + 60 <= end; minute += 60) values.push(`${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`);
+  return values;
+}
+async function availabilityFor(date: string, client: import('pg').Pool | import('pg').PoolClient = pool) {
+  const rule = await client.query(`SELECT COALESCE(e.is_open,r.is_open) AS is_open,
+    COALESCE(e.opens_at,r.opens_at)::text AS opens_at, COALESCE(e.closes_at,r.closes_at)::text AS closes_at
+    FROM workshop_schedule_rules r LEFT JOIN workshop_schedule_exceptions e ON e.day=$1 WHERE r.weekday=$2`, [date, weekdayFor(date)]);
+  if (!rule.rowCount || !rule.rows[0].is_open) return { slots: [] as string[], occupied: [] as string[] };
+  const slots = slotRange(rule.rows[0].opens_at, rule.rows[0].closes_at);
+  const [occupied, blocked] = await Promise.all([
+    client.query(`SELECT to_char(appointment_time,'HH24:MI') AS time FROM appointments WHERE appointment_date=$1 AND status IN ('Confirmé','Pris en charge','En cours')`, [date]),
+    client.query(`SELECT to_char(slot_time,'HH24:MI') AS time FROM blocked_slots WHERE slot_date=$1`, [date]),
+  ]);
+  return { slots, occupied: [...occupied.rows, ...blocked.rows].map(row => row.time) };
+}
+function scheduledKind(value: unknown): 'À domicile' | 'En atelier' {
+  if (value === 'À domicile' || value === 'En atelier') return value;
+  throw new HttpError(400, 'Type d’intervention invalide.');
+}
 async function customerExists(id: string) {
   const result = await pool.query('SELECT 1 FROM customers WHERE id = $1', [id]);
   if (!result.rowCount) throw new HttpError(404, 'Client introuvable.');
@@ -234,7 +264,7 @@ async function customerData(id: string) {
 
 async function issueSession(userId: string, customerId: string, req: IncomingMessage, res: ServerResponse, role: Role = 'customer') {
   const sessionId = randomUUID(); const refresh = randomBytes(32).toString('base64url'); const hash = createHmac('sha256', accessSecret).update(refresh).digest('hex');
-  const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const expires = new Date(Date.now() + (role === 'customer' ? 90 : 30) * 24 * 60 * 60 * 1000);
   const agent = String(req.headers['user-agent'] || '').slice(0, 300);
   const label = /android/i.test(agent) ? 'Navigateur Android' : /iphone|ipad/i.test(agent) ? 'Navigateur iOS' : 'Navigateur web';
   await pool.query(`INSERT INTO user_sessions (id,user_id,refresh_token_hash,user_agent,device_label,expires_at) VALUES ($1,$2,$3,$4,$5,$6)`, [sessionId, userId, hash, agent, label, expires]);
@@ -246,6 +276,7 @@ async function issueSession(userId: string, customerId: string, req: IncomingMes
 }
 async function createChallenge(req: IncomingMessage, input: Record<string, unknown>, purpose: 'register' | 'login' | 'phone_change', userId?: string) {
   const phone = normalizePhone(input.phone); limit(`otp:ip:${clientIp(req)}`, 12, 15 * 60_000); limit(`otp:phone:${phone}`, 4, 15 * 60_000);
+  if (isYasPhone(phone) && purpose !== 'phone_change') throw new HttpError(409, 'Ce numéro nécessite une validation manuelle par l’atelier. Créez votre code PIN pour continuer.');
   const last = await pool.query(`SELECT resend_available_at FROM otp_challenges WHERE phone_e164=$1 AND purpose=$2
     AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1`, [phone, purpose]);
   if (last.rowCount && new Date(last.rows[0].resend_available_at) > new Date()) throw new HttpError(429, 'Attendez une minute avant de demander un nouveau code.');
@@ -289,17 +320,17 @@ async function verifyChallenge(req: IncomingMessage, input: Record<string, unkno
     let userId = challenge.user_id as string; let customerId: string;
     if (purpose === 'register') {
       userId = randomUUID(); customerId = randomUUID();
-      await client.query(`INSERT INTO users (id,phone_e164,role,phone_verified_at) VALUES ($1,$2,'customer',now())`, [userId, challenge.phone_e164]);
+      await client.query(`INSERT INTO users (id,phone_e164,role,phone_verified_at,phone_verification_status,phone_verified_method) VALUES ($1,$2,'customer',now(),'verified_otp','otp')`, [userId, challenge.phone_e164]);
       await client.query(`INSERT INTO customers (id,user_id,name,phone,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version)
         VALUES ($1,$2,$3,$4,$5,$6,now(),$7,now(),$8)`, [customerId, userId, `${challenge.registration_first_name} ${challenge.registration_last_name}`, challenge.phone_e164, challenge.registration_first_name, challenge.registration_last_name, termsVersion, privacyVersion]);
     } else if (purpose === 'login') {
       const profile = await client.query('SELECT c.id, u.id AS user_id FROM users u JOIN customers c ON c.user_id=u.id WHERE u.phone_e164=$1 AND u.status=\'active\'', [challenge.phone_e164]);
       if (!profile.rowCount) throw new HttpError(404, 'Aucun compte ne correspond à ce numéro.'); userId = profile.rows[0].user_id; customerId = profile.rows[0].id;
-      await client.query('UPDATE users SET phone_verified_at=COALESCE(phone_verified_at,now()) WHERE id=$1', [userId]);
+      await client.query(`UPDATE users SET phone_verified_at=COALESCE(phone_verified_at,now()),phone_verification_status='verified_otp',phone_verified_method='otp' WHERE id=$1`, [userId]);
     } else {
       if (!userId) throw new HttpError(400, 'Demande OTP introuvable.');
       const profile = await client.query('SELECT id FROM customers WHERE user_id=$1', [userId]); if (!profile.rowCount) throw new HttpError(404, 'Compte introuvable.'); customerId = profile.rows[0].id;
-      await client.query('UPDATE users SET phone_e164=$2, phone_verified_at=now(), updated_at=now() WHERE id=$1', [userId, challenge.phone_e164]);
+      await client.query(`UPDATE users SET phone_e164=$2, phone_verified_at=now(),phone_verification_status='verified_otp',phone_verified_method='otp', updated_at=now() WHERE id=$1`, [userId, challenge.phone_e164]);
       await client.query('UPDATE customers SET phone=$2 WHERE id=$1', [customerId, challenge.phone_e164]);
       // A changed identity invalidates sessions issued for the previous number.
       await client.query('UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL', [userId]);
@@ -308,6 +339,50 @@ async function verifyChallenge(req: IncomingMessage, input: Record<string, unkno
     if (testMode) await unlink(`/tmp/mms-test-otp-${challengeId}`).catch(() => undefined);
     return await issueSession(userId, customerId!, req, res);
   } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; } finally { client.release(); }
+}
+
+async function customerPinLogin(req: IncomingMessage, input: Record<string, unknown>, res: ServerResponse) {
+  const phone = normalizePhone(input.phone); const value = pin(input.pin);
+  limit(`customer-pin-ip:${clientIp(req)}`, 20, 15 * 60_000); limit(`customer-pin-phone:${phone}`, 8, 15 * 60_000);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const found = await client.query(`SELECT u.id AS user_id,c.id AS customer_id,p.pin_hash,p.failed_attempts,p.locked_until
+      FROM users u JOIN customers c ON c.user_id=u.id LEFT JOIN customer_pin_credentials p ON p.user_id=u.id
+      WHERE u.phone_e164=$1 AND u.status='active' FOR UPDATE`, [phone]);
+    const generic = new HttpError(401, 'Numéro ou code PIN incorrect.');
+    if (!found.rowCount || !found.rows[0].pin_hash) throw generic;
+    const row = found.rows[0];
+    if (row.locked_until && new Date(row.locked_until) > new Date()) throw new HttpError(429, 'Trop de tentatives. Réessayez dans 15 minutes.');
+    if (!await verifyPassword(row.pin_hash, pinSecret(value))) {
+      const failures = Number(row.failed_attempts) + 1;
+      await client.query(`UPDATE customer_pin_credentials SET failed_attempts=$2,locked_until=CASE WHEN $2>=5 THEN now()+interval '15 minutes' ELSE NULL END,updated_at=now() WHERE user_id=$1`, [row.user_id, failures]);
+      await client.query('COMMIT'); throw generic;
+    }
+    await client.query('UPDATE customer_pin_credentials SET failed_attempts=0,locked_until=NULL,updated_at=now() WHERE user_id=$1', [row.user_id]);
+    await client.query('COMMIT');
+    return issueSession(row.user_id, row.customer_id, req, res);
+  } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; } finally { client.release(); }
+}
+async function setCustomerPin(req: IncomingMessage, input: Record<string, unknown>, res: ServerResponse) {
+  const auth = await identity(req); const value = pin(input.pin); limit(`customer-pin-set:${auth.userId}`, 5, 60 * 60_000);
+  const digest = await hashPassword(pinSecret(value));
+  await pool.query(`INSERT INTO customer_pin_credentials(user_id,pin_hash,failed_attempts,locked_until) VALUES($1,$2,0,NULL)
+    ON CONFLICT(user_id) DO UPDATE SET pin_hash=excluded.pin_hash,failed_attempts=0,locked_until=NULL,updated_at=now()`, [auth.userId, digest]);
+  return send(res, 200, { ok: true });
+}
+async function createYasCustomer(req: IncomingMessage, input: Record<string, unknown>, res: ServerResponse) {
+  const phone = normalizePhone(input.phone); if (!isYasPhone(phone)) throw new HttpError(400, 'Ce parcours est réservé aux numéros Yas.');
+  const firstName = textField(input.firstName, 'Prénom', 1, 80); const lastName = textField(input.lastName, 'Nom', 1, 80); const value = pin(input.pin);
+  if (input.termsAccepted !== true || input.privacyAccepted !== true) throw new HttpError(400, 'Vous devez accepter les conditions et la politique de confidentialité.');
+  limit(`yas-register-ip:${clientIp(req)}`, 8, 60 * 60_000);
+  const userId = randomUUID(), customerId = randomUUID(), digest = await hashPassword(pinSecret(value)); const client = await pool.connect();
+  try { await client.query('BEGIN');
+    await client.query(`INSERT INTO users(id,phone_e164,role,phone_verification_status) VALUES($1,$2,'customer','pending_manual')`, [userId, phone]);
+    await client.query(`INSERT INTO customers(id,user_id,name,phone,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version) VALUES($1,$2,$3,$4,$5,$6,now(),$7,now(),$8)`, [customerId,userId,`${firstName} ${lastName}`,phone,firstName,lastName,termsVersion,privacyVersion]);
+    await client.query('INSERT INTO customer_pin_credentials(user_id,pin_hash) VALUES($1,$2)', [userId,digest]); await client.query('COMMIT');
+    return issueSession(userId, customerId, req, res);
+  } catch (error) { await client.query('ROLLBACK').catch(() => undefined); if ((error as {code?:string}).code==='23505') throw new HttpError(409,'Un compte existe déjà avec ce numéro.'); throw error; } finally { client.release(); }
 }
 
 async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: string[], method: string, path: URL) {
@@ -377,6 +452,46 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       count(*) FILTER (WHERE status='completed' AND completed_at::date=CURRENT_DATE)::integer AS "doneToday"
       FROM tickets`);
     return send(res, 200, result.rows[0]);
+  }
+  if (parts[2] === 'schedule') {
+    if (!['workshop_manager','admin'].includes(auth.role)) throw new HttpError(403, 'Accès réservé au responsable atelier ou à l’administrateur.');
+    if (method === 'GET' && parts.length === 3) {
+      const [rules, exceptions, blocks] = await Promise.all([
+        pool.query(`SELECT weekday,opens_at::text AS "opensAt",closes_at::text AS "closesAt",is_open AS "isOpen" FROM workshop_schedule_rules ORDER BY weekday`),
+        pool.query(`SELECT to_char(day,'YYYY-MM-DD') AS day,opens_at::text AS "opensAt",closes_at::text AS "closesAt",is_open AS "isOpen",reason FROM workshop_schedule_exceptions ORDER BY day`),
+        pool.query(`SELECT id,to_char(slot_date,'YYYY-MM-DD') AS date,to_char(slot_time,'HH24:MI') AS time,reason FROM blocked_slots ORDER BY slot_date,slot_time`),
+      ]); return send(res, 200, { timezone: 'Indian/Antananarivo', rules: rules.rows, exceptions: exceptions.rows, blockedSlots: blocks.rows });
+    }
+    if (method === 'PUT' && parts[3] === 'rules' && parts.length === 4) {
+      const input = await body(req); if (!Array.isArray(input.rules) || input.rules.length !== 7) throw new HttpError(400, 'Les sept jours doivent être renseignés.');
+      const client = await pool.connect(); try { await client.query('BEGIN');
+        for (const raw of input.rules as Record<string,unknown>[]) { const weekday = integerField(raw.weekday,'Jour',0,6); const open = raw.isOpen === true; const opens = open ? textField(raw.opensAt,'Ouverture',5,5) : null; const closes = open ? textField(raw.closesAt,'Fermeture',5,5) : null; if (open && (!/^\d\d:\d\d$/.test(opens!) || !/^\d\d:\d\d$/.test(closes!) || opens! >= closes!)) throw new HttpError(400,'Horaires invalides.'); await client.query(`INSERT INTO workshop_schedule_rules(weekday,opens_at,closes_at,is_open,updated_at) VALUES($1,$2,$3,$4,now()) ON CONFLICT(weekday) DO UPDATE SET opens_at=excluded.opens_at,closes_at=excluded.closes_at,is_open=excluded.is_open,updated_at=now()`,[weekday,opens,closes,open]); }
+        await client.query('COMMIT'); return send(res,200,{ok:true});
+      } catch(error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+    }
+    if (method === 'POST' && parts[3] === 'exceptions' && parts.length === 4) {
+      const input = await body(req); const day=textField(input.day,'Date',10,10); if(!datePattern.test(day)) throw new HttpError(400,'Date invalide.'); const open=input.isOpen===true; const opens=open?textField(input.opensAt,'Ouverture',5,5):null; const closes=open?textField(input.closesAt,'Fermeture',5,5):null; if(open && (!/^\d\d:\d\d$/.test(opens!) || !/^\d\d:\d\d$/.test(closes!) || opens!>=closes!)) throw new HttpError(400,'Horaires invalides.'); await pool.query(`INSERT INTO workshop_schedule_exceptions(day,opens_at,closes_at,is_open,reason,created_by_user_id) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(day) DO UPDATE SET opens_at=excluded.opens_at,closes_at=excluded.closes_at,is_open=excluded.is_open,reason=excluded.reason,created_by_user_id=excluded.created_by_user_id`,[day,opens,closes,open,textField(input.reason??'','Motif',0,300),auth.userId]); return send(res,201,{ok:true});
+    }
+    if (method === 'POST' && parts[3] === 'blocks' && parts.length === 4) { const input=await body(req); const day=textField(input.date,'Date',10,10), time=textField(input.time,'Créneau',5,5); if(!datePattern.test(day)||!/^\d\d:\d\d$/.test(time)) throw new HttpError(400,'Créneau invalide.'); await pool.query(`INSERT INTO blocked_slots(id,slot_date,slot_time,reason,created_by_user_id) VALUES($1,$2,$3,$4,$5)`,[randomUUID(),day,time,textField(input.reason??'','Motif',0,300),auth.userId]); return send(res,201,{ok:true}); }
+    if (method === 'DELETE' && parts[3] === 'blocks' && parts[4] && parts.length === 5) { await pool.query('DELETE FROM blocked_slots WHERE id=$1',[uuid(parts[4])]); return send(res,200,{ok:true}); }
+    throw new HttpError(404,'Route introuvable.');
+  }
+  if (method === 'POST' && parts[2] === 'customers' && parts[3] && parts[4] === 'verify-phone' && parts.length === 5) {
+    const customerId = uuid(parts[3]);
+    if (auth.role === 'mechanic') {
+      const assigned = await pool.query(`SELECT 1 FROM tickets WHERE customer_id=$1 AND assigned_mechanic_user_id=$2 AND status NOT IN ('completed','cancelled')`, [customerId,auth.userId]);
+      if (!assigned.rowCount) throw new HttpError(403,'Ce client ne vous est pas attribué.');
+    } else if (!['workshop_manager','admin'].includes(auth.role)) throw new HttpError(403,'Accès refusé.');
+    const updated = await pool.query(`UPDATE users u SET phone_verified_at=COALESCE(phone_verified_at,now()),phone_verification_status='verified_manual',phone_verified_method='manual',phone_verified_by_user_id=$2,updated_at=now() FROM customers c WHERE c.id=$1 AND c.user_id=u.id RETURNING u.id`,[customerId,auth.userId]);
+    if (!updated.rowCount) throw new HttpError(404,'Client introuvable.');
+    await pool.query(`INSERT INTO customer_verification_events(customer_id,actor_user_id,action) VALUES($1,$2,'phone_verified_manual')`,[customerId,auth.userId]);
+    return send(res,200,{ok:true});
+  }
+  if (method === 'POST' && parts[2] === 'customers' && parts[3] && parts[4] === 'reset-pin' && parts.length === 5) {
+    if (!['workshop_manager','admin'].includes(auth.role)) throw new HttpError(403,'Accès réservé au responsable atelier ou à l’administrateur.');
+    const customerId=uuid(parts[3]); const target=await pool.query('SELECT u.id FROM users u JOIN customers c ON c.user_id=u.id WHERE c.id=$1',[customerId]); if(!target.rowCount) throw new HttpError(404,'Client introuvable.');
+    await pool.query('DELETE FROM customer_pin_credentials WHERE user_id=$1',[target.rows[0].id]); await pool.query(`INSERT INTO customer_verification_events(customer_id,actor_user_id,action) VALUES($1,$2,'pin_reset')`,[customerId,auth.userId]);
+    return send(res,200,{ok:true});
   }
   if (parts[2] !== 'tickets') throw new HttpError(404, 'Route introuvable.');
   await requireRole(req, ['mechanic','workshop_manager']);
@@ -583,6 +698,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   if (parts[1] === 'staff') return staffRoute(req, res, parts, method, path);
   if (parts[1] === 'admin') return adminRoute(req, res, parts, method, path);
   if (parts[1] === 'auth') {
+    if (method === 'POST' && parts[2] === 'pin-login' && parts.length === 3) return send(res, 200, await customerPinLogin(req, await body(req), res));
+    if (method === 'POST' && parts[2] === 'yas-register' && parts.length === 3) return send(res, 201, await createYasCustomer(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'register' && parts[3] === 'request-otp') return send(res, 200, await createChallenge(req, await body(req), 'register'));
     if (method === 'POST' && parts[2] === 'register' && parts[3] === 'verify-otp') return send(res, 201, await verifyChallenge(req, await body(req), 'register', res));
     if (method === 'POST' && parts[2] === 'login' && parts[3] === 'request-otp') return send(res, 200, await createChallenge(req, await body(req), 'login'));
@@ -601,6 +718,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     }
     if (method === 'POST' && parts[2] === 'logout') { const token = cookie(req, 'mms_refresh'); if (token) await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE refresh_token_hash=$1', [createHmac('sha256', accessSecret).update(token).digest('hex')]); res.setHeader('Set-Cookie', clearRefreshCookie()); return send(res, 200, { ok: true }); }
     const auth = await identity(req);
+    if (method === 'POST' && parts[2] === 'pin' && parts.length === 3) return setCustomerPin(req, await body(req), res);
     if (method === 'GET' && parts[2] === 'me') return send(res, 200, await customerData(auth.customerId));
     if (method === 'GET' && parts[2] === 'sessions') { const sessions = await pool.query(`SELECT id,device_label,created_at AS "createdAt",last_seen_at AS "lastSeenAt", id=$2 AS "current" FROM user_sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>now() ORDER BY last_seen_at DESC`, [auth.userId, auth.sessionId]); return send(res, 200, sessions.rows); }
     if (method === 'DELETE' && parts[2] === 'sessions' && parts[3]) { const id = uuid(parts[3]); await pool.query('UPDATE user_sessions SET revoked_at=now() WHERE id=$1 AND user_id=$2', [id, auth.userId]); return send(res, 200, { ok: true }); }
@@ -612,9 +730,43 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     const date = path.searchParams.get('date');
     if (kind !== 'À domicile' && kind !== 'En atelier') throw new HttpError(400, 'Type d’intervention invalide.');
     if (!date || !datePattern.test(date) || Number.isNaN(Date.parse(`${date}T12:00:00`))) throw new HttpError(400, 'Date invalide.');
-    const occupied = await pool.query(`SELECT to_char(appointment_time, 'HH24:MI') AS time FROM appointments
-      WHERE kind = $1 AND appointment_date = $2 AND status IN ('Confirmé', 'Pris en charge', 'En cours')`, [kind, date]);
-    return send(res, 200, { slots: slots[kind], occupied: occupied.rows.map(row => row.time) });
+    return send(res, 200, await availabilityFor(date));
+  }
+  if (method === 'POST' && parts[1] === 'bookings' && parts[2] === 'complete' && parts.length === 3) {
+    const auth = await identity(req); const input = await body(req);
+    const kind = input.kind === 'Urgence' ? 'Urgence' : scheduledKind(input.kind);
+    const problem = textField(input.problem, 'Description du problème', 10, 2000);
+    const vehicle = vehicleInput((input.vehicle && typeof input.vehicle === 'object' ? input.vehicle : {}) as Record<string, unknown>);
+    const address = textField(input.address ?? '', 'Localisation', kind === 'En atelier' ? 0 : 5, 500);
+    const date = kind === 'Urgence' ? null : textField(input.date, 'Date', 10, 10);
+    const time = kind === 'Urgence' ? null : textField(input.time, 'Créneau', 5, 5);
+    if (date && (!datePattern.test(date) || Number.isNaN(Date.parse(`${date}T12:00:00`)))) throw new HttpError(400, 'Date invalide.');
+    if (time && !/^\d{2}:\d{2}$/.test(time)) throw new HttpError(400, 'Créneau invalide.');
+    const contactPhone = input.contactPhone ? normalizePhone(input.contactPhone) : null;
+    const immobilized = typeof input.immobilized === 'boolean' ? input.immobilized : null;
+    if (kind === 'Urgence' && (contactPhone === null || immobilized === null)) throw new HttpError(400, 'Complétez les informations de dépannage.');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const vehicleId = randomUUID();
+      await client.query(`INSERT INTO vehicles(id,customer_id,name,model,plate,color,displacement_cc,production_year) VALUES($1,$2,$3,$4,$5,'#dce8ef',$6,$7)`, [vehicleId,auth.customerId,vehicle.name,vehicle.model,vehicle.plate,vehicle.displacementCc,vehicle.year]);
+      let appointmentId: string | null = null;
+      if (kind !== 'Urgence') {
+        const available = await availabilityFor(date!, client);
+        if (!available.slots.includes(time!) || available.occupied.includes(time!)) throw new HttpError(409, 'Ce créneau vient d’être réservé. Choisissez-en un autre.');
+        appointmentId = randomUUID();
+        await client.query(`INSERT INTO appointments(id,customer_id,vehicle_id,problem,kind,address,appointment_date,appointment_time,status,contact_phone,immobilized)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,'Confirmé',$9,$10)`, [appointmentId,auth.customerId,vehicleId,problem,kind,address,date,time,contactPhone,immobilized]);
+      }
+      const ticketId = randomUUID(); const sequence = await client.query(`SELECT nextval('ticket_reference_seq') AS value`);
+      const reference = ticketReference(String(sequence.rows[0].value));
+      await client.query(`INSERT INTO tickets(id,reference,customer_id,vehicle_id,appointment_id,intervention_type,description,status,created_by_user_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'new',$8)`, [ticketId,reference,auth.customerId,vehicleId,appointmentId,kind,problem,auth.userId]);
+      await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,new_value) VALUES($1,$2,'ticket_created','new')`, [ticketId,auth.userId]);
+      await client.query('COMMIT');
+      const result = await pool.query(`SELECT t.id,t.reference,t.appointment_id AS "appointmentId",t.vehicle_id AS "vehicleId",t.intervention_type AS "interventionType",t.description,t.status,t.created_at AS "createdAt",a.appointment_date AS "appointmentDate",a.appointment_time AS "appointmentTime" FROM tickets t LEFT JOIN appointments a ON a.id=t.appointment_id WHERE t.id=$1`, [ticketId]);
+      return send(res, 201, { ticket: result.rows[0], appointmentId });
+    } catch (error) { await client.query('ROLLBACK').catch(() => undefined); if ((error as {code?: string}).code === '23505') throw new HttpError(409, 'Ce créneau vient d’être réservé. Choisissez-en un autre.'); throw error; } finally { client.release(); }
   }
   if (parts[1] === 'customers' && parts[2]) {
     const customerId = uuid(parts[2]);
@@ -704,7 +856,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
         date = textField(input.date, 'Date', 10, 10);
         time = textField(input.time, 'Créneau', 5, 5);
         if (!datePattern.test(date) || Number.isNaN(Date.parse(`${date}T12:00:00`)) || date < localDate(now)) throw new HttpError(400, 'Date non disponible.');
-        if (!slots[kind as ScheduledKind].some(slot => slot === time)) throw new HttpError(400, 'Créneau invalide.');
+        const available = await availabilityFor(date);
+        if (!available.slots.includes(time) || available.occupied.includes(time)) throw new HttpError(400, 'Créneau invalide ou indisponible.');
       }
       const id = randomUUID();
       const client = await pool.connect();
