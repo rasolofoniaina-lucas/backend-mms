@@ -76,13 +76,71 @@ test('Facebook OAuth local simulé, identités et protections', async t => {
     const refreshed = await request('/api/auth/refresh', { method: 'POST', cookie: refreshCookie, body: {} });
     assert.equal(refreshed.status, 200); assert.equal(refreshed.data.user.user.id, createdUserId);
   });
-  await t.test('email identique ne fusionne jamais automatiquement les comptes', async () => {
-    const email = `conflict-${suffix}@example.mg`; const phone = `+261372${suffix.slice(-6).padStart(6, '0')}`;
-    const registered = await request('/api/auth/customer-register', { method: 'POST', body: { firstName: 'Compte', lastName: 'Local', phone, email, password: 'password123' } });
-    assert.equal(registered.status, 201);
-    const returned = await callback('conflict'); assert.equal(returned.location, '/login?facebook=FACEBOOK_ACCOUNT_LINK_REQUIRED');
-    const identities = await pool.query(`SELECT count(*)::int AS count FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [`facebook-conflict-${suffix}`]);
-    assert.equal(identities.rows[0].count, 0);
+  const register = async (phone, email, password = 'password123') => {
+    const result = await request('/api/auth/customer-register', { method: 'POST', body: { firstName: 'Compte', lastName: 'Local', phone, email, password } });
+    assert.equal(result.status, 201); return result;
+  };
+  await t.test('téléphone existant ne crée aucun user puis le bon mot de passe lie Facebook', async () => {
+    const phone = `+2613301${suffix.padStart(5, '0')}`; const email = `existing-${suffix}@example.mg`;
+    await register(phone, email);
+    const owner = await pool.query('SELECT id FROM users WHERE phone_e164=$1', [phone]); const before = await pool.query('SELECT count(*)::int AS count FROM users');
+    const returned = await callback('existing-phone'); const pendingCookie = returned.cookies.find(value => value.startsWith('mms_facebook_pending=')); assert.ok(pendingCookie);
+    const completed = await request('/api/auth/facebook/complete', { method: 'POST', cookie: pendingCookie, body: { firstName: 'Ignore', lastName: 'Ignore', phone, email: 'ignored@example.mg' } });
+    assert.equal(completed.status, 409); assert.equal(completed.data.code, 'FACEBOOK_EXISTING_ACCOUNT');
+    const afterConflict = await pool.query('SELECT count(*)::int AS count FROM users'); assert.equal(afterConflict.rows[0].count, before.rows[0].count);
+    const linked = await request('/api/auth/facebook/link-existing', { method: 'POST', cookie: pendingCookie, body: { phone, password: 'password123' } });
+    assert.equal(linked.status, 200); assert.ok(linked.data.accessToken);
+    const identity = await pool.query(`SELECT user_id FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [`facebook-existing-${suffix}`]);
+    assert.equal(identity.rows[0].user_id, owner.rows[0].id);
+    const afterLink = await pool.query('SELECT count(*)::int AS count FROM users'); assert.equal(afterLink.rows[0].count, before.rows[0].count);
+  });
+  await t.test('mauvais mot de passe ne lie jamais Facebook', async () => {
+    const phone = `+2613302${suffix.padStart(5, '0')}`; const email = `wrong-${suffix}@example.mg`;
+    await register(phone, email);
+    const returned = await callback('wrong-password'); const pendingCookie = returned.cookies.find(value => value.startsWith('mms_facebook_pending=')); assert.ok(pendingCookie);
+    const completed = await request('/api/auth/facebook/complete', { method: 'POST', cookie: pendingCookie, body: { firstName: 'Compte', lastName: 'Local', phone, email } });
+    assert.equal(completed.data.code, 'FACEBOOK_EXISTING_ACCOUNT');
+    const linked = await request('/api/auth/facebook/link-existing', { method: 'POST', cookie: pendingCookie, body: { phone, password: 'incorrect-password' } });
+    assert.equal(linked.status, 401); assert.equal(linked.data.error, 'Identifiant ou mot de passe incorrect.');
+    const identity = await pool.query(`SELECT count(*)::int AS count FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [`facebook-wrong-${suffix}`]);
+    assert.equal(identity.rows[0].count, 0);
+  });
+  await t.test('identité Facebook liée ailleurs est refusée sans déplacement', async () => {
+    const targetPhone = `+2613303${suffix.padStart(5, '0')}`; const otherPhone = `+2613304${suffix.padStart(5, '0')}`;
+    await register(targetPhone, `linked-${suffix}@example.mg`); await register(otherPhone, `linked-other-${suffix}@example.mg`);
+    const returned = await callback('already-linked'); const pendingCookie = returned.cookies.find(value => value.startsWith('mms_facebook_pending=')); assert.ok(pendingCookie);
+    const completed = await request('/api/auth/facebook/complete', { method: 'POST', cookie: pendingCookie, body: { firstName: 'Compte', lastName: 'Cible', phone: targetPhone, email: `linked-${suffix}@example.mg` } });
+    assert.equal(completed.data.code, 'FACEBOOK_EXISTING_ACCOUNT');
+    const other = await pool.query('SELECT id FROM users WHERE phone_e164=$1', [otherPhone]);
+    await pool.query(`INSERT INTO user_identities(id,user_id,provider,provider_subject) VALUES(gen_random_uuid(),$1,'facebook',$2)`, [other.rows[0].id, `facebook-linked-${suffix}`]);
+    const linked = await request('/api/auth/facebook/link-existing', { method: 'POST', cookie: pendingCookie, body: { phone: targetPhone, password: 'password123' } });
+    assert.equal(linked.status, 409); assert.equal(linked.data.code, 'FACEBOOK_ALREADY_LINKED');
+    const identity = await pool.query(`SELECT user_id FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [`facebook-linked-${suffix}`]);
+    assert.equal(identity.rows[0].user_id, other.rows[0].id);
+  });
+  await t.test('email User A et téléphone User B sont refusés sans fusion', async () => {
+    const phoneA = `+2613305${suffix.padStart(5, '0')}`; const phoneB = `+2613306${suffix.padStart(5, '0')}`;
+    await register(phoneA, `cross-email-${suffix}@example.mg`); await register(phoneB, `cross-phone-${suffix}@example.mg`);
+    const returned = await callback('cross-account'); const pendingCookie = returned.cookies.find(value => value.startsWith('mms_facebook_pending=')); assert.ok(pendingCookie);
+    const before = await pool.query('SELECT count(*)::int AS count FROM users');
+    const completed = await request('/api/auth/facebook/complete', { method: 'POST', cookie: pendingCookie, body: { firstName: 'Conflit', lastName: 'Croise', phone: phoneB, email: `cross-email-${suffix}@example.mg` } });
+    assert.equal(completed.status, 409); assert.equal(completed.data.code, 'FACEBOOK_IDENTITY_CONFLICT');
+    const identity = await pool.query(`SELECT count(*)::int AS count FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [`facebook-cross-${suffix}`]);
+    const after = await pool.query('SELECT count(*)::int AS count FROM users'); assert.equal(identity.rows[0].count, 0); assert.equal(after.rows[0].count, before.rows[0].count);
+  });
+  await t.test('booking claim est consommé par le compte existant après authentification', async () => {
+    const phone = `+2613307${suffix.padStart(5, '0')}`; const email = `booking-existing-${suffix}@example.mg`;
+    await register(phone, email); const before = await pool.query('SELECT count(*)::int AS count FROM users');
+    const booking = await request('/api/bookings/complete', { method: 'POST', body: { kind: 'Urgence', address: 'Analakely, Antananarivo', problem: 'La moto ne démarre plus depuis ce matin.', firstName: 'Aina', lastName: 'Booking', email: `anonymous-${suffix}@example.mg`, contactPhone: phone, immobilized: true, vehicle: { name: 'Yamaha', displacementCc: 125, year: 2024, model: '', plate: '' } } });
+    assert.equal(booking.status, 201); assert.ok(booking.data.bookingClaim);
+    const returned = await callback('booking-existing'); const pendingCookie = returned.cookies.find(value => value.startsWith('mms_facebook_pending=')); assert.ok(pendingCookie);
+    const completed = await request('/api/auth/facebook/complete', { method: 'POST', cookie: pendingCookie, body: { firstName: 'Aina', lastName: 'Booking', phone, email } });
+    assert.equal(completed.data.code, 'FACEBOOK_EXISTING_ACCOUNT');
+    const linked = await request('/api/auth/facebook/link-existing', { method: 'POST', cookie: pendingCookie, body: { phone, password: 'password123', claimToken: booking.data.bookingClaim } });
+    assert.equal(linked.status, 200); assert.ok(linked.data.user.tickets.some(ticket => ticket.reference === booking.data.ticket.reference));
+    const claimHash = createHmac('sha256', accessSecret).update(`booking:${booking.data.bookingClaim}`).digest('hex');
+    const claim = await pool.query('SELECT consumed_at FROM booking_claims WHERE token_hash=$1', [claimHash]); assert.ok(claim.rows[0].consumed_at);
+    const after = await pool.query('SELECT count(*)::int AS count FROM users'); assert.equal(after.rows[0].count, before.rows[0].count);
   });
   await t.test('profil sans email exige et conserve une vraie adresse fournie par le client', async () => {
     const returned = await callback('no-email'); const pendingCookie = returned.cookies.find(value => value.startsWith('mms_facebook_pending=')); assert.ok(pendingCookie);

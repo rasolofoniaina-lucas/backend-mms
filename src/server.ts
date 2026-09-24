@@ -547,11 +547,6 @@ async function facebookCallback(req: IncomingMessage, res: ServerResponse, path:
     await issueSession(identity.rows[0].user_id, identity.rows[0].customer_id, req, res);
     return redirect(res, '/login?facebook=success');
   }
-  if (profile.email) {
-    const emailConflict = await pool.query(`SELECT 1 FROM customers c JOIN users u ON u.id=c.user_id
-      WHERE lower(c.email)=lower($1) AND u.status='active' LIMIT 1`, [profile.email]);
-    if (emailConflict.rowCount) return redirect(res, '/login?facebook=FACEBOOK_ACCOUNT_LINK_REQUIRED');
-  }
   const names = splitFacebookName(profile.name);
   const rawToken = randomBytes(32).toString('base64url');
   await pool.query(`DELETE FROM external_auth_registrations WHERE expires_at<=now() OR consumed_at IS NOT NULL`);
@@ -573,8 +568,6 @@ async function completeFacebook(req: IncomingMessage, res: ServerResponse, input
   limit(`facebook-complete:${clientIp(req)}`, 10, 60 * 60_000);
   const token = cookie(req, 'mms_facebook_pending');
   if (!token) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
-  const firstName = textField(input.firstName, 'Prénom', 1, 80);
-  const lastName = textField(input.lastName, 'Nom', 1, 80);
   const phone = normalizePhone(input.phone);
   const client = await pool.connect();
   const userId = randomUUID(); const customerId = randomUUID();
@@ -584,12 +577,25 @@ async function completeFacebook(req: IncomingMessage, res: ServerResponse, input
       AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, [facebookPendingHash(token)]);
     if (!pending.rowCount) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
     const row = pending.rows[0];
+    const firstName = row.first_name ? textField(row.first_name, 'Prénom', 1, 80) : textField(input.firstName, 'Prénom', 1, 80);
+    const lastName = row.last_name ? textField(row.last_name, 'Nom', 1, 80) : textField(input.lastName, 'Nom', 1, 80);
     const email = row.email ? customerEmail(row.email) : customerEmail(input.email);
-    const conflict = await client.query(`SELECT u.id FROM users u LEFT JOIN customers c ON c.user_id=u.id
+    const linked = await client.query(`SELECT user_id FROM user_identities WHERE provider='facebook' AND provider_subject=$1 FOR UPDATE`, [row.provider_subject]);
+    if (linked.rowCount) throw new HttpError(409, 'Ce compte Facebook est déjà associé à un autre espace MMS.', 'FACEBOOK_ALREADY_LINKED');
+    const conflicts = await client.query(`SELECT u.id,u.phone_e164=$1 AS phone_match,lower(c.email)=lower($2) AS email_match
+      FROM users u JOIN customers c ON c.user_id=u.id
       WHERE u.status='active' AND (u.phone_e164=$1 OR lower(c.email)=lower($2)) FOR UPDATE OF u`, [phone, email]);
-    if (conflict.rowCount) throw new HttpError(409, 'Un espace MMS utilise déjà ces coordonnées. Connectez-vous avec votre méthode habituelle ou contactez l’atelier.');
-    const linked = await client.query(`SELECT 1 FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [row.provider_subject]);
-    if (linked.rowCount) throw new HttpError(409, 'Ce compte Facebook est déjà associé à un espace MMS. Recommencez la connexion.');
+    const phoneAccount = conflicts.rows.find(account => account.phone_match);
+    const emailAccounts = conflicts.rows.filter(account => account.email_match);
+    if (phoneAccount && emailAccounts.some(account => account.id !== phoneAccount.id)) {
+      throw new HttpError(409, 'Ces informations sont déjà associées à des espaces MMS différents. Contactez l’atelier pour obtenir de l’aide.', 'FACEBOOK_IDENTITY_CONFLICT');
+    }
+    if (phoneAccount) {
+      throw new HttpError(409, 'Ce numéro est déjà associé à un espace MMS.', 'FACEBOOK_EXISTING_ACCOUNT');
+    }
+    if (emailAccounts.length) {
+      throw new HttpError(409, 'Cette adresse email est déjà associée à un espace MMS. Contactez l’atelier pour obtenir de l’aide.', 'FACEBOOK_DETAILS_ALREADY_USED');
+    }
     await client.query(`INSERT INTO users(id,phone_e164,role,phone_verification_status) VALUES($1,$2,'customer','unverified')`, [userId, phone]);
     await client.query(`INSERT INTO customers(id,user_id,name,phone,email,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version)
       VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,now(),$9)`, [customerId,userId,`${firstName} ${lastName}`,phone,email,firstName,lastName,termsVersion,privacyVersion]);
@@ -603,6 +609,79 @@ async function completeFacebook(req: IncomingMessage, res: ServerResponse, input
   } finally { client.release(); }
   appendCookie(res, clearFacebookCookie('mms_facebook_pending'));
   return issueSession(userId, customerId, req, res);
+}
+async function linkFacebookToExisting(req: IncomingMessage, res: ServerResponse, input: Record<string, unknown>) {
+  const token = cookie(req, 'mms_facebook_pending');
+  if (!token) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
+  const phone = normalizePhone(input.phone);
+  const password = typeof input.password === 'string' ? input.password : '';
+  const claimToken = typeof input.claimToken === 'string' ? input.claimToken : '';
+  limit(`facebook-link-ip:${clientIp(req)}`, 20, 15 * 60_000);
+  limit(`facebook-link-phone:${phone}`, 8, 15 * 60_000);
+  const generic = new HttpError(401, 'Identifiant ou mot de passe incorrect.');
+  const client = await pool.connect();
+  let userId = ''; let customerId = ''; let passwordHash = '';
+  try {
+    await client.query('BEGIN');
+    const pending = await client.query(`SELECT * FROM external_auth_registrations WHERE provider='facebook' AND token_hash=$1
+      AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, [facebookPendingHash(token)]);
+    if (!pending.rowCount) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
+    const row = pending.rows[0];
+    const target = await client.query(`SELECT u.id AS user_id,c.id AS customer_id,cc.password_hash,cc.must_change_password,cc.temporary_password_expires_at
+      FROM users u JOIN customers c ON c.user_id=u.id JOIN customer_credentials cc ON cc.user_id=u.id
+      WHERE u.phone_e164=$1 AND u.role='customer' AND u.status='active' FOR UPDATE OF u,cc`, [phone]);
+    if (!target.rowCount || !await verifyPassword(target.rows[0].password_hash, password)) throw generic;
+    if (target.rows[0].must_change_password && (!target.rows[0].temporary_password_expires_at || new Date(target.rows[0].temporary_password_expires_at) <= new Date())) {
+      throw new HttpError(401, "Ce mot de passe temporaire a expiré. Contactez l'atelier.");
+    }
+    userId = target.rows[0].user_id; customerId = target.rows[0].customer_id; passwordHash = target.rows[0].password_hash;
+    const linkedIdentity = await client.query(`SELECT user_id FROM user_identities
+      WHERE provider='facebook' AND provider_subject=$1 FOR UPDATE`, [row.provider_subject]);
+    if (linkedIdentity.rowCount && linkedIdentity.rows[0].user_id !== userId) {
+      throw new HttpError(409, 'Ce compte Facebook est déjà associé à un autre espace MMS.', 'FACEBOOK_ALREADY_LINKED');
+    }
+    const targetFacebook = await client.query(`SELECT provider_subject FROM user_identities
+      WHERE provider='facebook' AND user_id=$1 FOR UPDATE`, [userId]);
+    if (targetFacebook.rowCount && targetFacebook.rows[0].provider_subject !== row.provider_subject) {
+      throw new HttpError(409, 'Ce compte Facebook est déjà associé à un autre espace MMS.', 'FACEBOOK_ALREADY_LINKED');
+    }
+    if (row.email) {
+      const emailOwner = await client.query(`SELECT u.id FROM users u JOIN customers c ON c.user_id=u.id
+        WHERE lower(c.email)=lower($1) AND u.status='active' FOR UPDATE OF u`, [customerEmail(row.email)]);
+      if (emailOwner.rows.some(owner => owner.id !== userId)) {
+        throw new HttpError(409, 'Ces informations sont déjà associées à des espaces MMS différents. Contactez l’atelier pour obtenir de l’aide.', 'FACEBOOK_IDENTITY_CONFLICT');
+      }
+    }
+    if (claimToken) {
+      const claimHash = createHmac('sha256', accessSecret).update(`booking:${claimToken}`).digest('hex');
+      const claim = await client.query(`SELECT bc.id,bc.customer_id,bc.ticket_id,bc.expires_at,c.user_id
+        FROM booking_claims bc JOIN customers c ON c.id=bc.customer_id JOIN tickets t ON t.id=bc.ticket_id
+        WHERE bc.token_hash=$1 AND bc.consumed_at IS NULL FOR UPDATE`, [claimHash]);
+      if (!claim.rowCount || new Date(claim.rows[0].expires_at) <= new Date()) {
+        throw new HttpError(409, 'Cette demande ne peut plus être rattachée automatiquement à un compte. Contactez l’atelier si vous avez besoin d’aide.');
+      }
+      if (claim.rows[0].user_id && claim.rows[0].user_id !== userId) {
+        throw new HttpError(409, 'Cette demande a déjà été associée à un espace MMS.');
+      }
+      if (!claim.rows[0].user_id) {
+        await client.query('UPDATE vehicles SET customer_id=$2 WHERE customer_id=$1', [claim.rows[0].customer_id, customerId]);
+        await client.query('UPDATE appointments SET customer_id=$2 WHERE customer_id=$1', [claim.rows[0].customer_id, customerId]);
+        await client.query('UPDATE tickets SET customer_id=$2 WHERE id=$1', [claim.rows[0].ticket_id, customerId]);
+      }
+      await client.query('UPDATE booking_claims SET consumed_at=now() WHERE id=$1', [claim.rows[0].id]);
+    }
+    if (!linkedIdentity.rowCount) {
+      await client.query(`INSERT INTO user_identities(id,user_id,provider,provider_subject) VALUES($1,$2,'facebook',$3)`, [randomUUID(), userId, row.provider_subject]);
+    }
+    await client.query(`UPDATE external_auth_registrations SET consumed_at=now() WHERE id=$1`, [row.id]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    if ((error as { code?: string }).code === '23505') throw new HttpError(409, 'Ce compte Facebook est déjà associé à un autre espace MMS.', 'FACEBOOK_ALREADY_LINKED');
+    throw error;
+  } finally { client.release(); }
+  appendCookie(res, clearFacebookCookie('mms_facebook_pending'));
+  return issueSession(userId, customerId, req, res, 'customer', passwordHash);
 }
 async function changeCustomerPassword(req: IncomingMessage, res: ServerResponse, input: Record<string, unknown>) {
   const auth = await identity(req, ['customer'], true);
@@ -998,6 +1077,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (method === 'GET' && parts[2] === 'facebook' && parts[3] === 'callback' && parts.length === 4) return facebookCallback(req, res, path);
     if (method === 'GET' && parts[2] === 'facebook' && parts[3] === 'pending' && parts.length === 4) return send(res, 200, await facebookPending(req));
     if (method === 'POST' && parts[2] === 'facebook' && parts[3] === 'complete' && parts.length === 4) return send(res, 201, await completeFacebook(req, res, await body(req)));
+    if (method === 'POST' && parts[2] === 'facebook' && parts[3] === 'link-existing' && parts.length === 4) return send(res, 200, await linkFacebookToExisting(req, res, await body(req)));
     if (method === 'POST' && parts[2] === 'recovery-request' && parts.length === 3) return send(res, 200, await createRecoveryRequest(req, await body(req)));
     if (method === 'POST' && parts[2] === 'customer-register' && parts.length === 3) return send(res, 201, await registerCustomerPassword(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'customer-login' && parts.length === 3) return send(res, 200, await customerPasswordLogin(req, await body(req), res));
