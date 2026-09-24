@@ -60,8 +60,28 @@ CREATE TABLE IF NOT EXISTS user_identities (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(user_id,provider)
 );
+ALTER TABLE user_identities DROP CONSTRAINT IF EXISTS user_identities_provider_check;
+ALTER TABLE user_identities ADD CONSTRAINT user_identities_provider_check
+  CHECK (provider IN ('local','ldap','active_directory','oidc','facebook'));
 CREATE UNIQUE INDEX IF NOT EXISTS user_identities_provider_subject_unique
   ON user_identities(provider,lower(provider_subject));
+
+-- Short-lived server-side continuation for Facebook accounts that still need
+-- MMS-required contact details. OAuth access tokens are never stored here.
+CREATE TABLE IF NOT EXISTS external_auth_registrations (
+  id uuid PRIMARY KEY,
+  provider text NOT NULL CHECK (provider IN ('facebook')),
+  token_hash text NOT NULL UNIQUE,
+  provider_subject text NOT NULL,
+  first_name text,
+  last_name text,
+  email text,
+  expires_at timestamptz NOT NULL,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS external_auth_registrations_expiry_idx
+  ON external_auth_registrations(expires_at) WHERE consumed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS local_credentials (
   user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

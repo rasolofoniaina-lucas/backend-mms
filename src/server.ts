@@ -7,6 +7,7 @@ import { isIP } from 'node:net';
 import { Pool } from 'pg';
 import { normalizeMalagasyPhone } from './phone.js';
 import { createSmsProvider, SmsProviderError } from './sms-provider.js';
+import { FacebookOAuthError, facebookAuthorizationUrl, facebookConfig, fetchFacebookProfile, type FacebookConfig } from './facebook-auth.js';
 import { canTransition, hashPassword, isStaffRole, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword, type Role, type TicketStatus } from './staff-domain.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
@@ -115,11 +116,21 @@ async function identity(req: IncomingMessage, allowed: readonly Role[] = ['custo
 function cookie(req: IncomingMessage, name: string) { return req.headers.cookie?.split(';').map(x => x.trim()).find(x => x.startsWith(`${name}=`))?.slice(name.length + 1); }
 function refreshCookie(value: string, expiresAt: Date) { return `mms_refresh=${value}; Path=/api/auth; HttpOnly; SameSite=Lax; ${cookieSecure ? 'Secure; ' : ''}Expires=${expiresAt.toUTCString()}`; }
 function clearRefreshCookie() { return `mms_refresh=; Path=/api/auth; HttpOnly; SameSite=Lax; ${cookieSecure ? 'Secure; ' : ''}Max-Age=0`; }
+function appendCookie(res: ServerResponse, value: string) {
+  const current = res.getHeader('Set-Cookie');
+  res.setHeader('Set-Cookie', current ? [...(Array.isArray(current) ? current : [String(current)]), value] : value);
+}
+function facebookCookie(name: string, value: string, maxAge: number) { return `${name}=${value}; Path=/api/auth/facebook; HttpOnly; SameSite=Lax; ${cookieSecure ? 'Secure; ' : ''}Max-Age=${maxAge}`; }
+function clearFacebookCookie(name: string) { return facebookCookie(name, '', 0); }
 function maskedPhone(phone: string) { return phone.replace(/(\+261\s?\d\d)\d+(\d\d)/, '$1 ** *** $2'); }
 
 function send(res: ServerResponse, status: number, data: unknown) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
   res.end(JSON.stringify(data));
+}
+function redirect(res: ServerResponse, location: string) {
+  res.writeHead(302, { Location: location, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+  res.end();
 }
 function textField(value: unknown, label: string, min = 0, max = 255): string {
   if (typeof value !== 'string' || value.trim().length < min || value.trim().length > max) throw new HttpError(400, `${label} invalide.`);
@@ -294,7 +305,7 @@ async function issueSession(userId: string, customerId: string, req: IncomingMes
       throw new HttpError(401, 'Session expirée.');
     }
   }
-  res.setHeader('Set-Cookie', refreshCookie(refresh, expires));
+  appendCookie(res, refreshCookie(refresh, expires));
   if (role === 'customer') return restricted
     ? { accessToken: accessToken({ userId, customerId, sessionId, role }), user: { user: { id: customerId }, mustChangePassword: true }, mustChangePassword: true }
     : { accessToken: accessToken({ userId, customerId, sessionId, role }), user: await customerData(customerId), mustChangePassword: false };
@@ -470,6 +481,128 @@ async function customerPasswordLogin(req: IncomingMessage, input: Record<string,
   if (found.rows[0].must_change_password && (!found.rows[0].temporary_password_expires_at || new Date(found.rows[0].temporary_password_expires_at) <= new Date())) throw new HttpError(401, "Ce mot de passe temporaire a expiré. Contactez l'atelier.");
   const session = await issueSession(found.rows[0].user_id,found.rows[0].customer_id,req,res,'customer',found.rows[0].password_hash);
   return { ...session, mustChangePassword: Boolean(found.rows[0].must_change_password) };
+}
+function requiredFacebookConfig(): FacebookConfig {
+  try {
+    const config = facebookConfig(process.env);
+    if (!config) throw new FacebookOAuthError('configuration');
+    return config;
+  } catch (error) {
+    if (error instanceof FacebookOAuthError && error.phase === 'configuration') throw new HttpError(503, 'Facebook Login n’est pas configuré.');
+    throw error;
+  }
+}
+function facebookStateSignature(state: string, expires: number) {
+  return createHmac('sha256', accessSecret).update(`facebook-state:${state}:${expires}`).digest('base64url');
+}
+function facebookStateCookie() {
+  const state = randomBytes(32).toString('base64url');
+  const expires = Date.now() + 10 * 60_000;
+  return { state, value: `${state}.${expires}.${facebookStateSignature(state, expires)}` };
+}
+function validFacebookState(req: IncomingMessage, received: string | null) {
+  const saved = cookie(req, 'mms_facebook_state');
+  if (!saved || !received) return false;
+  const [state, expiresRaw, signature] = saved.split('.');
+  const expires = Number(expiresRaw);
+  if (!state || !signature || !Number.isFinite(expires) || expires <= Date.now() || state !== received) return false;
+  const expected = facebookStateSignature(state, expires);
+  return expected.length === signature.length && timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+}
+function facebookPendingHash(token: string) {
+  return createHmac('sha256', accessSecret).update(`facebook-pending:${token}`).digest('hex');
+}
+function splitFacebookName(name: string) {
+  const values = name.trim().split(/\s+/).filter(Boolean);
+  return { firstName: values.shift() || '', lastName: values.join(' ') };
+}
+async function beginFacebook(req: IncomingMessage, res: ServerResponse) {
+  limit(`facebook-start:${clientIp(req)}`, 30, 15 * 60_000);
+  const config = requiredFacebookConfig();
+  const state = facebookStateCookie();
+  appendCookie(res, facebookCookie('mms_facebook_state', state.value, 600));
+  return redirect(res, facebookAuthorizationUrl(config, state.state));
+}
+async function facebookCallback(req: IncomingMessage, res: ServerResponse, path: URL) {
+  const stateValid = validFacebookState(req, path.searchParams.get('state'));
+  appendCookie(res, clearFacebookCookie('mms_facebook_state'));
+  if (!stateValid) return redirect(res, '/login?facebook=invalid-state');
+  if (path.searchParams.has('error')) return redirect(res, '/login?facebook=cancelled');
+  const code = path.searchParams.get('code');
+  if (!code || code.length > 2048) return redirect(res, '/login?facebook=error');
+  limit(`facebook-callback:${clientIp(req)}`, 30, 15 * 60_000);
+  let profile;
+  try { profile = await fetchFacebookProfile(requiredFacebookConfig(), code); }
+  catch (error) {
+    if (error instanceof FacebookOAuthError) {
+      console.warn('Facebook OAuth indisponible', { phase: error.phase, status: error.status || 'network-or-response' });
+      return redirect(res, '/login?facebook=error');
+    }
+    throw error;
+  }
+  const identity = await pool.query(`SELECT u.id AS user_id,c.id AS customer_id FROM user_identities ui
+    JOIN users u ON u.id=ui.user_id JOIN customers c ON c.user_id=u.id
+    WHERE ui.provider='facebook' AND ui.provider_subject=$1 AND u.role='customer' AND u.status='active'`, [profile.id]);
+  if (identity.rowCount) {
+    await issueSession(identity.rows[0].user_id, identity.rows[0].customer_id, req, res);
+    return redirect(res, '/login?facebook=success');
+  }
+  if (profile.email) {
+    const emailConflict = await pool.query(`SELECT 1 FROM customers c JOIN users u ON u.id=c.user_id
+      WHERE lower(c.email)=lower($1) AND u.status='active' LIMIT 1`, [profile.email]);
+    if (emailConflict.rowCount) return redirect(res, '/login?facebook=FACEBOOK_ACCOUNT_LINK_REQUIRED');
+  }
+  const names = splitFacebookName(profile.name);
+  const rawToken = randomBytes(32).toString('base64url');
+  await pool.query(`DELETE FROM external_auth_registrations WHERE expires_at<=now() OR consumed_at IS NOT NULL`);
+  await pool.query(`INSERT INTO external_auth_registrations(id,provider,token_hash,provider_subject,first_name,last_name,email,expires_at)
+    VALUES($1,'facebook',$2,$3,$4,$5,$6,now()+interval '10 minutes')`,
+  [randomUUID(), facebookPendingHash(rawToken), profile.id, names.firstName, names.lastName, profile.email]);
+  appendCookie(res, facebookCookie('mms_facebook_pending', rawToken, 600));
+  return redirect(res, '/register?facebook=complete');
+}
+async function facebookPending(req: IncomingMessage) {
+  const token = cookie(req, 'mms_facebook_pending');
+  if (!token) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
+  const found = await pool.query(`SELECT first_name AS "firstName",last_name AS "lastName",email
+    FROM external_auth_registrations WHERE provider='facebook' AND token_hash=$1 AND consumed_at IS NULL AND expires_at>now()`, [facebookPendingHash(token)]);
+  if (!found.rowCount) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
+  return { ...found.rows[0], emailProvided: Boolean(found.rows[0].email) };
+}
+async function completeFacebook(req: IncomingMessage, res: ServerResponse, input: Record<string, unknown>) {
+  limit(`facebook-complete:${clientIp(req)}`, 10, 60 * 60_000);
+  const token = cookie(req, 'mms_facebook_pending');
+  if (!token) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
+  const firstName = textField(input.firstName, 'Prénom', 1, 80);
+  const lastName = textField(input.lastName, 'Nom', 1, 80);
+  const phone = normalizePhone(input.phone);
+  const client = await pool.connect();
+  const userId = randomUUID(); const customerId = randomUUID();
+  try {
+    await client.query('BEGIN');
+    const pending = await client.query(`SELECT * FROM external_auth_registrations WHERE provider='facebook' AND token_hash=$1
+      AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`, [facebookPendingHash(token)]);
+    if (!pending.rowCount) throw new HttpError(401, 'Cette connexion Facebook a expiré. Recommencez.');
+    const row = pending.rows[0];
+    const email = row.email ? customerEmail(row.email) : customerEmail(input.email);
+    const conflict = await client.query(`SELECT u.id FROM users u LEFT JOIN customers c ON c.user_id=u.id
+      WHERE u.status='active' AND (u.phone_e164=$1 OR lower(c.email)=lower($2)) FOR UPDATE OF u`, [phone, email]);
+    if (conflict.rowCount) throw new HttpError(409, 'Un espace MMS utilise déjà ces coordonnées. Connectez-vous avec votre méthode habituelle ou contactez l’atelier.');
+    const linked = await client.query(`SELECT 1 FROM user_identities WHERE provider='facebook' AND provider_subject=$1`, [row.provider_subject]);
+    if (linked.rowCount) throw new HttpError(409, 'Ce compte Facebook est déjà associé à un espace MMS. Recommencez la connexion.');
+    await client.query(`INSERT INTO users(id,phone_e164,role,phone_verification_status) VALUES($1,$2,'customer','unverified')`, [userId, phone]);
+    await client.query(`INSERT INTO customers(id,user_id,name,phone,email,first_name,last_name,terms_accepted_at,terms_version,privacy_accepted_at,privacy_version)
+      VALUES($1,$2,$3,$4,$5,$6,$7,now(),$8,now(),$9)`, [customerId,userId,`${firstName} ${lastName}`,phone,email,firstName,lastName,termsVersion,privacyVersion]);
+    await client.query(`INSERT INTO user_identities(id,user_id,provider,provider_subject) VALUES($1,$2,'facebook',$3)`, [randomUUID(),userId,row.provider_subject]);
+    await client.query(`UPDATE external_auth_registrations SET consumed_at=now() WHERE id=$1`, [row.id]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    if ((error as { code?: string }).code === '23505') throw new HttpError(409, 'Un espace MMS utilise déjà ces coordonnées. Connectez-vous avec votre méthode habituelle ou contactez l’atelier.');
+    throw error;
+  } finally { client.release(); }
+  appendCookie(res, clearFacebookCookie('mms_facebook_pending'));
+  return issueSession(userId, customerId, req, res);
 }
 async function changeCustomerPassword(req: IncomingMessage, res: ServerResponse, input: Record<string, unknown>) {
   const auth = await identity(req, ['customer'], true);
@@ -861,6 +994,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   if (parts[1] === 'staff') return staffRoute(req, res, parts, method, path);
   if (parts[1] === 'admin') return adminRoute(req, res, parts, method, path);
   if (parts[1] === 'auth') {
+    if (method === 'GET' && parts[2] === 'facebook' && parts.length === 3) return beginFacebook(req, res);
+    if (method === 'GET' && parts[2] === 'facebook' && parts[3] === 'callback' && parts.length === 4) return facebookCallback(req, res, path);
+    if (method === 'GET' && parts[2] === 'facebook' && parts[3] === 'pending' && parts.length === 4) return send(res, 200, await facebookPending(req));
+    if (method === 'POST' && parts[2] === 'facebook' && parts[3] === 'complete' && parts.length === 4) return send(res, 201, await completeFacebook(req, res, await body(req)));
     if (method === 'POST' && parts[2] === 'recovery-request' && parts.length === 3) return send(res, 200, await createRecoveryRequest(req, await body(req)));
     if (method === 'POST' && parts[2] === 'customer-register' && parts.length === 3) return send(res, 201, await registerCustomerPassword(req, await body(req), res));
     if (method === 'POST' && parts[2] === 'customer-login' && parts.length === 3) return send(res, 200, await customerPasswordLogin(req, await body(req), res));
