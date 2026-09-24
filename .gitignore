@@ -1,4 +1,33 @@
+# Dependencies and generated output
 node_modules/
 dist/
-.env
+coverage/
 *.tsbuildinfo
+
+# Local environment files (the documented template remains versioned)
+.env
+.env.*
+!.env.example
+
+# Local data, backups and logs
+*.log
+*.dump
+*.sql
+!src/**/*.sql
+!migrations/**/*.sql
+*.bak
+
+# Certificates and keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editors and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*~
