@@ -1,7 +1,7 @@
 import { randomInt } from 'node:crypto';
 import { Algorithm, hash, verify } from '@node-rs/argon2';
 
-export const staffRoles = ['mechanic', 'workshop_manager', 'admin'] as const;
+export const staffRoles = ['mechanic', 'workshop_manager', 'admin', 'commercial'] as const;
 export type StaffRole = typeof staffRoles[number];
 export type Role = 'customer' | StaffRole;
 export type TicketStatus = 'new' | 'triage' | 'assigned' | 'in_progress' | 'waiting_customer' | 'completed' | 'cancelled';

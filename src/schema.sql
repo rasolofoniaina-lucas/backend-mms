@@ -28,7 +28,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at timestamptz;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
-ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('customer', 'mechanic', 'workshop_manager', 'admin'));
+ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('customer', 'mechanic', 'workshop_manager', 'admin', 'commercial'));
 -- Phase A installations had staff passwords on users. Give those development
 -- identities a stable collision-free username before tightening constraints.
 UPDATE users SET username='legacy_' || substr(replace(id::text,'-',''),1,12)
@@ -48,7 +48,7 @@ WHERE phone_verification_status='unverified' AND phone_verified_at IS NOT NULL;
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_identity_shape_check;
 ALTER TABLE users ADD CONSTRAINT users_identity_shape_check CHECK (
   (role='customer' AND phone_e164 IS NOT NULL AND username IS NULL)
-  OR (role IN ('mechanic','workshop_manager','admin') AND phone_e164 IS NULL
+  OR (role IN ('mechanic','workshop_manager','admin','commercial') AND phone_e164 IS NULL
       AND username IS NOT NULL AND username ~ '^[a-z][a-z0-9._-]{2,31}$')
 );
 
@@ -393,3 +393,204 @@ WHERE NOT EXISTS (SELECT 1 FROM tickets t WHERE t.appointment_id=a.id);
 INSERT INTO ticket_events (ticket_id, actor_user_id, event_type, new_value, created_at)
 SELECT t.id, t.created_by_user_id, 'ticket_created', t.status, t.created_at
 FROM tickets t WHERE NOT EXISTS (SELECT 1 FROM ticket_events e WHERE e.ticket_id=t.id);
+
+-- =====================================================================
+-- Shop S1: catalogue, banners and orders managed by the commercial team.
+-- Additive only. Images live in shop_media (bytea, like vehicle_photos), so
+-- no user-controlled path ever reaches the filesystem.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS shop_media (
+  id uuid PRIMARY KEY,
+  mime_type text NOT NULL CHECK (mime_type IN ('image/jpeg','image/png','image/webp')),
+  image_data bytea NOT NULL,
+  byte_size integer NOT NULL CHECK (byte_size > 0),
+  created_by_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS shop_categories (
+  id uuid PRIMARY KEY,
+  parent_id uuid REFERENCES shop_categories(id),
+  name text NOT NULL,
+  slug text NOT NULL,
+  description text,
+  image_media_id uuid REFERENCES shop_media(id),
+  display_order integer NOT NULL DEFAULT 0,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (parent_id IS NULL OR parent_id <> id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_categories_slug_unique ON shop_categories(slug);
+CREATE INDEX IF NOT EXISTS shop_categories_parent_idx ON shop_categories(parent_id, display_order);
+
+CREATE TABLE IF NOT EXISTS shop_brands (
+  id uuid PRIMARY KEY,
+  name text NOT NULL,
+  slug text NOT NULL,
+  logo_media_id uuid REFERENCES shop_media(id),
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_brands_slug_unique ON shop_brands(slug);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_brands_name_unique ON shop_brands(lower(name));
+
+CREATE TABLE IF NOT EXISTS shop_products (
+  id uuid PRIMARY KEY,
+  sku text NOT NULL,
+  name text NOT NULL,
+  slug text NOT NULL,
+  short_description text NOT NULL DEFAULT '',
+  description text NOT NULL DEFAULT '',
+  category_id uuid NOT NULL REFERENCES shop_categories(id),
+  brand_id uuid REFERENCES shop_brands(id),
+  price_ariary integer NOT NULL CHECK (price_ariary >= 0),
+  compare_at_price_ariary integer CHECK (compare_at_price_ariary IS NULL OR compare_at_price_ariary > price_ariary),
+  stock_quantity integer NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
+  compatibility_type text NOT NULL DEFAULT 'universal' CHECK (compatibility_type IN ('universal','vehicle_specific')),
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published','archived')),
+  featured boolean NOT NULL DEFAULT false,
+  new_product boolean NOT NULL DEFAULT false,
+  active boolean NOT NULL DEFAULT true,
+  created_by_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_products_sku_unique ON shop_products(upper(sku));
+CREATE UNIQUE INDEX IF NOT EXISTS shop_products_slug_unique ON shop_products(slug);
+CREATE INDEX IF NOT EXISTS shop_products_category_idx ON shop_products(category_id, status);
+CREATE INDEX IF NOT EXISTS shop_products_brand_idx ON shop_products(brand_id, status);
+CREATE INDEX IF NOT EXISTS shop_products_status_created_idx ON shop_products(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS shop_products_featured_idx ON shop_products(featured, status) WHERE featured;
+
+CREATE TABLE IF NOT EXISTS shop_product_variants (
+  id uuid PRIMARY KEY,
+  product_id uuid NOT NULL REFERENCES shop_products(id),
+  sku text NOT NULL,
+  label text NOT NULL,
+  attributes jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(attributes) = 'object'),
+  price_override_ariary integer CHECK (price_override_ariary IS NULL OR price_override_ariary >= 0),
+  stock_quantity integer NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
+  display_order integer NOT NULL DEFAULT 0,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_product_variants_sku_unique ON shop_product_variants(upper(sku));
+CREATE INDEX IF NOT EXISTS shop_product_variants_product_idx ON shop_product_variants(product_id, display_order);
+
+CREATE TABLE IF NOT EXISTS shop_product_images (
+  id uuid PRIMARY KEY,
+  product_id uuid NOT NULL REFERENCES shop_products(id),
+  media_id uuid NOT NULL REFERENCES shop_media(id),
+  alt_text text NOT NULL DEFAULT '',
+  display_order integer NOT NULL DEFAULT 0,
+  is_primary boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS shop_product_images_product_idx ON shop_product_images(product_id, display_order);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_product_images_one_primary ON shop_product_images(product_id) WHERE is_primary;
+
+-- Vehicle-specific fitments. NULL model/year/cc means "any" for that field.
+CREATE TABLE IF NOT EXISTS shop_product_fitments (
+  id uuid PRIMARY KEY,
+  product_id uuid NOT NULL REFERENCES shop_products(id),
+  make text NOT NULL,
+  model text,
+  year_min integer CHECK (year_min IS NULL OR year_min BETWEEN 1885 AND 2100),
+  year_max integer CHECK (year_max IS NULL OR year_max BETWEEN 1885 AND 2100),
+  displacement_cc integer CHECK (displacement_cc IS NULL OR displacement_cc BETWEEN 1 AND 5000),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (year_min IS NULL OR year_max IS NULL OR year_min <= year_max)
+);
+CREATE INDEX IF NOT EXISTS shop_product_fitments_product_idx ON shop_product_fitments(product_id);
+CREATE INDEX IF NOT EXISTS shop_product_fitments_make_idx ON shop_product_fitments(lower(make));
+
+CREATE TABLE IF NOT EXISTS shop_banners (
+  id uuid PRIMARY KEY,
+  title text NOT NULL,
+  subtitle text NOT NULL DEFAULT '',
+  desktop_media_id uuid REFERENCES shop_media(id),
+  mobile_media_id uuid REFERENCES shop_media(id),
+  cta_label text NOT NULL DEFAULT '',
+  cta_url text NOT NULL DEFAULT '',
+  active boolean NOT NULL DEFAULT false,
+  display_order integer NOT NULL DEFAULT 0,
+  start_at timestamptz,
+  end_at timestamptz,
+  created_by_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (start_at IS NULL OR end_at IS NULL OR start_at < end_at)
+);
+CREATE INDEX IF NOT EXISTS shop_banners_schedule_idx ON shop_banners(active, start_at, end_at, display_order);
+
+CREATE SEQUENCE IF NOT EXISTS shop_order_reference_seq;
+CREATE TABLE IF NOT EXISTS shop_orders (
+  id uuid PRIMARY KEY,
+  reference text NOT NULL,
+  customer_id uuid REFERENCES customers(id),
+  first_name text NOT NULL,
+  last_name text NOT NULL,
+  phone text NOT NULL,
+  email text,
+  status text NOT NULL DEFAULT 'submitted' CHECK (status IN ('submitted','confirmed','preparing','ready','completed','cancelled')),
+  subtotal_ariary integer NOT NULL CHECK (subtotal_ariary >= 0),
+  total_ariary integer NOT NULL CHECK (total_ariary >= 0),
+  notes text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS shop_orders_reference_unique ON shop_orders(reference);
+CREATE INDEX IF NOT EXISTS shop_orders_status_created_idx ON shop_orders(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS shop_orders_customer_idx ON shop_orders(customer_id, created_at DESC);
+
+-- Order lines snapshot the catalogue at submission time; prices come from the server.
+CREATE TABLE IF NOT EXISTS shop_order_items (
+  id uuid PRIMARY KEY,
+  order_id uuid NOT NULL REFERENCES shop_orders(id),
+  product_id uuid NOT NULL REFERENCES shop_products(id),
+  variant_id uuid REFERENCES shop_product_variants(id),
+  sku text NOT NULL,
+  product_name text NOT NULL,
+  variant_label text,
+  quantity integer NOT NULL CHECK (quantity BETWEEN 1 AND 99),
+  unit_price_ariary integer NOT NULL CHECK (unit_price_ariary >= 0),
+  total_ariary integer NOT NULL CHECK (total_ariary >= 0)
+);
+CREATE INDEX IF NOT EXISTS shop_order_items_order_idx ON shop_order_items(order_id);
+
+CREATE TABLE IF NOT EXISTS shop_order_events (
+  id bigserial PRIMARY KEY,
+  order_id uuid NOT NULL REFERENCES shop_orders(id),
+  actor_user_id uuid REFERENCES users(id),
+  old_status text,
+  new_status text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS shop_order_events_order_idx ON shop_order_events(order_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS shop_stock_events (
+  id bigserial PRIMARY KEY,
+  product_id uuid NOT NULL REFERENCES shop_products(id),
+  variant_id uuid REFERENCES shop_product_variants(id),
+  order_id uuid REFERENCES shop_orders(id),
+  actor_user_id uuid REFERENCES users(id),
+  reason text NOT NULL CHECK (reason IN ('manual','order_confirmed','order_cancelled')),
+  old_quantity integer NOT NULL,
+  new_quantity integer NOT NULL CHECK (new_quantity >= 0),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS shop_stock_events_product_idx ON shop_stock_events(product_id, created_at DESC);
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='shop_order_events_append_only') THEN
+    CREATE TRIGGER shop_order_events_append_only BEFORE UPDATE OR DELETE ON shop_order_events
+      FOR EACH ROW EXECUTE FUNCTION reject_mms_audit_mutation();
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='shop_stock_events_append_only') THEN
+    CREATE TRIGGER shop_stock_events_append_only BEFORE UPDATE OR DELETE ON shop_stock_events
+      FOR EACH ROW EXECUTE FUNCTION reject_mms_audit_mutation();
+  END IF;
+END $$;

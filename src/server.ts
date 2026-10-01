@@ -8,6 +8,8 @@ import { Pool } from 'pg';
 import { normalizeMalagasyPhone } from './phone.js';
 import { createSmsProvider, SmsProviderError } from './sms-provider.js';
 import { FacebookOAuthError, facebookAuthorizationUrl, facebookConfig, fetchFacebookProfile, type FacebookConfig } from './facebook-auth.js';
+import { HttpError, integerField, textField } from './http.js';
+import { commerceRoute, shopRoute, type ShopDeps } from './shop.js';
 import { canTransition, hashPassword, isStaffRole, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword, type Role, type TicketStatus } from './staff-domain.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
@@ -33,9 +35,6 @@ const vehicleFields = `v.id, v.name, v.model, v.plate, v.color,
   CASE WHEN p.vehicle_id IS NOT NULL THEN '/api/customers/' || v.customer_id || '/vehicles/' || v.id ||
     '/photo?updated=' || (extract(epoch from p.updated_at) * 1000)::bigint ELSE NULL END AS "photoUrl"`;
 
-class HttpError extends Error {
-  constructor(public status: number, message: string, public code?: string) { super(message); }
-}
 
 type Identity = { userId: string; customerId: string; sessionId: string; role: Role; mustChangePassword?: boolean };
 const rateBuckets = new Map<string, { count: number; reset: number }>();
@@ -93,7 +92,7 @@ function verifyAccessToken(value: string): Identity {
   const expected = createHmac('sha256', accessSecret).update(`${header}.${payload}`).digest('base64url');
   if (expected.length !== signature.length || !timingSafeEqual(Buffer.from(expected), Buffer.from(signature))) throw new HttpError(401, 'Session expirée.');
   try { const token = JSON.parse(Buffer.from(payload, 'base64url').toString()) as { sub: string; cid: string; sid: string; role: string; exp: number };
-    if (token.exp * 1000 <= Date.now() || !['customer','mechanic','workshop_manager','admin'].includes(token.role)) throw new Error(); return { userId: token.sub, customerId: token.cid, sessionId: token.sid, role: token.role as Role };
+    if (token.exp * 1000 <= Date.now() || !['customer','mechanic','workshop_manager','admin','commercial'].includes(token.role)) throw new Error(); return { userId: token.sub, customerId: token.cid, sessionId: token.sid, role: token.role as Role };
   } catch { throw new HttpError(401, 'Session expirée.'); }
 }
 async function identity(req: IncomingMessage, allowed: readonly Role[] = ['customer'], allowPasswordChange = false) {
@@ -132,14 +131,6 @@ function redirect(res: ServerResponse, location: string) {
   res.writeHead(302, { Location: location, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
   res.end();
 }
-function textField(value: unknown, label: string, min = 0, max = 255): string {
-  if (typeof value !== 'string' || value.trim().length < min || value.trim().length > max) throw new HttpError(400, `${label} invalide.`);
-  return value.trim();
-}
-function integerField(value: unknown, label: string, min: number, max: number): number {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) throw new HttpError(400, `${label} invalide.`);
-  return value;
-}
 function vehicleInput(input: Record<string, unknown>) {
   return {
     name: textField(input.name, 'Marque de la moto', 1, 80),
@@ -171,7 +162,7 @@ function uuid(value: string | undefined): string {
   if (!value || !uuidPattern.test(value)) throw new HttpError(400, 'Identifiant invalide.');
   return value;
 }
-const allStaffRoles: Role[] = ['mechanic', 'workshop_manager', 'admin'];
+const allStaffRoles: Role[] = ['mechanic', 'workshop_manager', 'admin', 'commercial'];
 function requireRole(req: IncomingMessage, roles: readonly Role[], allowPasswordChange = false) {
   return identity(req, roles, allowPasswordChange);
 }
@@ -951,7 +942,7 @@ async function adminRoute(req: IncomingMessage, res: ServerResponse, parts: stri
     const filters: string[] = [];
     const role = path.searchParams.get('role');
     if (role) {
-      if (!['customer','mechanic','workshop_manager','admin'].includes(role)) throw new HttpError(400, 'Rôle invalide.');
+      if (!['customer','mechanic','workshop_manager','admin','commercial'].includes(role)) throw new HttpError(400, 'Rôle invalide.');
       values.push(role); filters.push(`u.role=$${values.length}`);
     }
     const q = path.searchParams.get('q');
@@ -968,7 +959,7 @@ async function adminRoute(req: IncomingMessage, res: ServerResponse, parts: stri
     limit(`admin-create:${auth.userId}`, 30, 60 * 60_000);
     const input = await body(req);
     const role = input.role;
-    if (!['customer','mechanic','workshop_manager','admin'].includes(String(role))) throw new HttpError(400, 'Rôle invalide.');
+    if (!['customer','mechanic','workshop_manager','admin','commercial'].includes(String(role))) throw new HttpError(400, 'Rôle invalide.');
     const firstName = textField(input.firstName, 'Prénom', 1, 80);
     const lastName = textField(input.lastName, 'Nom', 1, 80);
     const isCustomer = role === 'customer';
@@ -1059,6 +1050,16 @@ async function adminRoute(req: IncomingMessage, res: ServerResponse, parts: stri
   throw new HttpError(404, 'Route introuvable.');
 }
 
+const shopDeps: ShopDeps = {
+  pool, send, body, limit, clientIp, photoBody, normalizePhone, customerEmail,
+  requireRole: (req, roles) => requireRole(req, roles),
+  // A shop order may be placed as a guest; a valid customer session only links it to the account.
+  optionalCustomerId: async req => {
+    if (!req.headers.authorization) return null;
+    try { return (await identity(req, ['customer'])).customerId || null; } catch { return null; }
+  },
+};
+
 async function route(req: IncomingMessage, res: ServerResponse) {
   const method = req.method || 'GET';
   const path = new URL(req.url || '/', 'http://localhost');
@@ -1072,6 +1073,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   }
   if (parts[1] === 'staff') return staffRoute(req, res, parts, method, path);
   if (parts[1] === 'admin') return adminRoute(req, res, parts, method, path);
+  if (parts[1] === 'shop') return shopRoute(shopDeps, req, res, parts, method, path);
+  if (parts[1] === 'commerce') return commerceRoute(shopDeps, req, res, parts, method, path);
   if (parts[1] === 'auth') {
     if (method === 'GET' && parts[2] === 'facebook' && parts.length === 3) return beginFacebook(req, res);
     if (method === 'GET' && parts[2] === 'facebook' && parts[3] === 'callback' && parts.length === 4) return facebookCallback(req, res, path);
