@@ -93,6 +93,7 @@ async function inTransaction<T>(deps: ShopDeps, work: (client: PoolClient) => Pr
 // ---------------------------------------------------------------- catalogue reads
 const effectiveStock = `CASE WHEN vs.variant_count > 0 THEN vs.variant_stock ELSE p.stock_quantity END`;
 const productListSelect = `SELECT p.id,p.slug,p.sku,p.name,p.short_description AS "shortDescription",p.price_ariary AS "priceAriary",
+  p.price_on_request AS "priceOnRequest",
   p.compare_at_price_ariary AS "compareAtPriceAriary",p.new_product AS "newProduct",p.featured,p.status,p.active,
   p.compatibility_type AS "compatibilityType",p.updated_at AS "updatedAt",p.created_at AS "createdAt",
   b.name AS "brandName",b.slug AS "brandSlug",c.name AS "categoryName",c.slug AS "categorySlug",c.id AS "categoryId",b.id AS "brandId",
@@ -109,7 +110,7 @@ function productCard(row: Row) {
     id: row.id, slug: row.slug, sku: row.sku, name: row.name, shortDescription: row.shortDescription,
     brand: row.brandName ? { name: row.brandName, slug: row.brandSlug } : null,
     category: { name: row.categoryName, slug: row.categorySlug },
-    priceAriary: row.priceAriary, compareAtPriceAriary: row.compareAtPriceAriary, promo: row.compareAtPriceAriary !== null,
+    priceAriary: row.priceAriary, priceOnRequest: row.priceOnRequest, compareAtPriceAriary: row.compareAtPriceAriary, promo: row.compareAtPriceAriary !== null,
     newProduct: row.newProduct, featured: row.featured, hasVariants: row.variantCount > 0,
     stockState: stockState(row.stockQuantity), compatibilityType: row.compatibilityType as CompatibilityType,
     image: row.imageId ? { url: mediaUrl(row.imageId), alt: row.imageAlt || row.name } : null,
@@ -170,6 +171,7 @@ async function listPublicProducts(deps: ShopDeps, path: URL) {
   if (minPrice !== null) where.push(`p.price_ariary >= ${p(minPrice)}`);
   if (maxPrice !== null) where.push(`p.price_ariary <= ${p(maxPrice)}`);
   if (path.searchParams.get('inStock') === '1') where.push(`${effectiveStock} > 0`);
+  if (path.searchParams.get('orderable') === '1') where.push(`NOT p.price_on_request AND ${effectiveStock} > 0`);
   if (path.searchParams.get('new') === '1') where.push('p.new_product');
   if (path.searchParams.get('promo') === '1') where.push('p.compare_at_price_ariary IS NOT NULL');
   if (path.searchParams.get('featured') === '1') where.push('p.featured');
@@ -264,7 +266,7 @@ async function submitOrder(deps: ShopDeps, req: IncomingMessage) {
   const customerId = await deps.optionalCustomerId(req);
   return inTransaction(deps, async client => {
     const productIds = [...new Set(lines.map(line => line.productId))];
-    const products = await client.query(`SELECT p.id,p.sku,p.name,p.price_ariary,p.stock_quantity,
+    const products = await client.query(`SELECT p.id,p.sku,p.name,p.price_ariary,p.price_on_request,p.stock_quantity,
       (SELECT count(*)::integer FROM shop_product_variants v WHERE v.product_id=p.id AND v.active) AS variant_count
       FROM shop_products p JOIN shop_categories c ON c.id=p.category_id WHERE p.id = ANY($1::uuid[]) AND ${publicProduct}`, [productIds]);
     const productById = new Map(products.rows.map(row => [row.id, row]));
@@ -276,12 +278,14 @@ async function submitOrder(deps: ShopDeps, req: IncomingMessage) {
     const items = lines.map(line => {
       const product = productById.get(line.productId);
       if (!product) throw new HttpError(409, 'Un article du panier n’est plus disponible.');
+      if (product.price_on_request) throw new HttpError(409, 'Cet article est présenté uniquement en vitrine. Contactez l’atelier.');
       let sku = product.sku; let unit = product.price_ariary; let stock = product.stock_quantity; let variantLabel: string | null = null;
       if (product.variant_count > 0) {
         const variant = line.variantId ? variantById.get(line.variantId) : null;
         if (!variant || variant.product_id !== product.id) throw new HttpError(400, `Choisissez une option pour « ${product.name} ».`);
         sku = variant.sku; unit = variant.price_override_ariary ?? product.price_ariary; stock = variant.stock_quantity; variantLabel = variant.label;
       } else if (line.variantId) throw new HttpError(400, 'Option de produit invalide.');
+      if (unit <= 0) throw new HttpError(409, 'Cet article ne peut pas être commandé en ligne.');
       if (stock < line.quantity) throw new HttpError(409, `Stock insuffisant pour « ${product.name}${variantLabel ? ` – ${variantLabel}` : ''} ».`);
       const total = unit * line.quantity;
       subtotal += total;
@@ -352,7 +356,7 @@ async function changeOrderStatus(deps: ShopDeps, actorId: string, id: string, to
 
 // ---------------------------------------------------------------- commerce: products
 type ProductInput = Partial<{ sku: string; name: string; slug: string; shortDescription: string; description: string; categoryId: string;
-  brandId: string | null; priceAriary: number; compareAtPriceAriary: number | null; stockQuantity: number; compatibilityType: CompatibilityType;
+  brandId: string | null; priceAriary: number; priceOnRequest: boolean; compareAtPriceAriary: number | null; stockQuantity: number; compatibilityType: CompatibilityType;
   status: string; featured: boolean; newProduct: boolean; active: boolean }>;
 function productInput(input: Record<string, unknown>, creating: boolean): ProductInput {
   const out: ProductInput = {};
@@ -365,6 +369,7 @@ function productInput(input: Record<string, unknown>, creating: boolean): Produc
   if (required('categoryId')) out.categoryId = uuid(input.categoryId, 'Catégorie');
   if (has(input, 'brandId')) out.brandId = optionalUuid(input.brandId, 'Marque');
   if (required('priceAriary')) out.priceAriary = integerField(input.priceAriary, 'Prix', 0, MAX_PRICE_ARIARY);
+  if (has(input, 'priceOnRequest')) out.priceOnRequest = bool(input.priceOnRequest, 'Prix sur demande');
   if (has(input, 'compareAtPriceAriary')) out.compareAtPriceAriary = nullableInt(input.compareAtPriceAriary, 'Ancien prix', 1, MAX_PRICE_ARIARY);
   if (has(input, 'stockQuantity')) out.stockQuantity = integerField(input.stockQuantity, 'Stock', 0, 1_000_000);
   if (has(input, 'compatibilityType')) out.compatibilityType = oneOf(input.compatibilityType, compatibilityTypes, 'Compatibilité');
@@ -397,7 +402,7 @@ async function commerceProduct(db: Db, id: string) {
   ]);
   return {
     id: row.id, sku: row.sku, name: row.name, slug: row.slug, shortDescription: row.shortDescription, description: detail.rows[0].description,
-    categoryId: row.categoryId, brandId: row.brandId, priceAriary: row.priceAriary, compareAtPriceAriary: row.compareAtPriceAriary,
+    categoryId: row.categoryId, brandId: row.brandId, priceAriary: row.priceAriary, priceOnRequest: row.priceOnRequest, compareAtPriceAriary: row.compareAtPriceAriary,
     stockQuantity: detail.rows[0].stock_quantity, effectiveStock: row.stockQuantity, stockState: stockState(row.stockQuantity),
     compatibilityType: row.compatibilityType, status: row.status, featured: row.featured, newProduct: row.newProduct, active: row.active,
     images: images.rows.map(image => ({ ...image, url: mediaUrl(image.mediaId) })), variants: variants.rows, fitments: fitments.get(id) || [],
@@ -405,21 +410,23 @@ async function commerceProduct(db: Db, id: string) {
   };
 }
 async function assertPublishable(db: Db, id: string) {
-  const found = await db.query(`SELECT p.price_ariary,c.active AS category_active FROM shop_products p JOIN shop_categories c ON c.id=p.category_id WHERE p.id=$1`, [id]);
+  const found = await db.query(`SELECT p.price_ariary,p.price_on_request,p.compare_at_price_ariary,c.active AS category_active FROM shop_products p JOIN shop_categories c ON c.id=p.category_id WHERE p.id=$1`, [id]);
   if (!found.rows[0]?.category_active) throw new HttpError(409, 'Publiez d’abord dans une catégorie active.');
-  if (found.rows[0].price_ariary <= 0) throw new HttpError(409, 'Un produit publié doit avoir un prix.');
+  if (found.rows[0].price_on_request) {
+    if (found.rows[0].price_ariary !== 0 || found.rows[0].compare_at_price_ariary !== null) throw new HttpError(409, 'Un article vitrine ne doit pas afficher de prix.');
+  } else if (found.rows[0].price_ariary <= 0) throw new HttpError(409, 'Un produit commandable doit avoir un prix.');
 }
 async function saveProduct(deps: ShopDeps, actorId: string, input: Record<string, unknown>, id?: string) {
   const values = productInput(input, !id);
   return inTransaction(deps, async client => {
     if (id) {
-      const current = await client.query('SELECT price_ariary,compare_at_price_ariary,stock_quantity FROM shop_products WHERE id=$1 FOR UPDATE', [id]);
+      const current = await client.query('SELECT price_ariary,price_on_request,compare_at_price_ariary,stock_quantity FROM shop_products WHERE id=$1 FOR UPDATE', [id]);
       if (!current.rowCount) throw new HttpError(404, 'Produit introuvable.');
       const price = values.priceAriary ?? current.rows[0].price_ariary;
       const compare = values.compareAtPriceAriary !== undefined ? values.compareAtPriceAriary : current.rows[0].compare_at_price_ariary;
       if (compare !== null && compare <= price) throw new HttpError(400, 'L’ancien prix doit être supérieur au prix actuel.');
       const columns: Record<string, string> = { sku: 'sku', name: 'name', slug: 'slug', shortDescription: 'short_description', description: 'description',
-        categoryId: 'category_id', brandId: 'brand_id', priceAriary: 'price_ariary', compareAtPriceAriary: 'compare_at_price_ariary', stockQuantity: 'stock_quantity',
+        categoryId: 'category_id', brandId: 'brand_id', priceAriary: 'price_ariary', priceOnRequest: 'price_on_request', compareAtPriceAriary: 'compare_at_price_ariary', stockQuantity: 'stock_quantity',
         compatibilityType: 'compatibility_type', status: 'status', featured: 'featured', newProduct: 'new_product', active: 'active' };
       const { values: params, p } = sqlParams();
       const sets = Object.entries(values).map(([key, value]) => `${columns[key]}=${p(value)}`);
@@ -429,16 +436,17 @@ async function saveProduct(deps: ShopDeps, actorId: string, input: Record<string
         await client.query(`INSERT INTO shop_stock_events(product_id,actor_user_id,reason,old_quantity,new_quantity) VALUES($1,$2,'manual',$3,$4)`,
           [id, actorId, current.rows[0].stock_quantity, values.stockQuantity]);
       }
-      if (values.status === 'published') await assertPublishable(client, id);
+      const resultingStatus = values.status ?? (await client.query('SELECT status FROM shop_products WHERE id=$1', [id])).rows[0].status;
+      if (resultingStatus === 'published') await assertPublishable(client, id);
       return commerceProduct(client, id);
     }
     if (values.compareAtPriceAriary != null && values.compareAtPriceAriary <= values.priceAriary!) throw new HttpError(400, 'L’ancien prix doit être supérieur au prix actuel.');
     const newId = randomUUID();
     const slug = values.slug || await uniqueSlug(client, 'shop_products', values.name!);
-    await client.query(`INSERT INTO shop_products(id,sku,name,slug,short_description,description,category_id,brand_id,price_ariary,compare_at_price_ariary,
+    await client.query(`INSERT INTO shop_products(id,sku,name,slug,short_description,description,category_id,brand_id,price_ariary,price_on_request,compare_at_price_ariary,
       stock_quantity,compatibility_type,status,featured,new_product,active,created_by_user_id)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, [newId, values.sku, values.name, slug, values.shortDescription ?? '',
-      values.description ?? '', values.categoryId, values.brandId ?? null, values.priceAriary, values.compareAtPriceAriary ?? null, values.stockQuantity ?? 0,
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, [newId, values.sku, values.name, slug, values.shortDescription ?? '',
+      values.description ?? '', values.categoryId, values.brandId ?? null, values.priceAriary, values.priceOnRequest ?? false, values.compareAtPriceAriary ?? null, values.stockQuantity ?? 0,
       values.compatibilityType ?? 'universal', values.status ?? 'draft', values.featured ?? false, values.newProduct ?? false, values.active ?? true, actorId]);
     if (values.status === 'published') await assertPublishable(client, newId);
     return commerceProduct(client, newId);

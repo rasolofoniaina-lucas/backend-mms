@@ -150,6 +150,31 @@ test('Boutique S1 : RBAC commercial, catalogue, publicités, commandes et stock'
     assert.equal((await api(`/commerce/products/${sized.id}/variants`, { method: 'PUT', token: c, body: { variants: [{ sku: sku('BAD'), label: 'x', attributes: { 'Bad Key': 1 } }] } })).status, 400);
     sized = variants.data;
   });
+  await t.test('vitrine : prix sur demande visible mais commande refusée côté serveur', async () => {
+    const showcaseCategory = (await api('/commerce/categories', { method: 'POST', token: c, body: { name: `Vitrine ${run}` } })).data;
+    const noPrice = await api('/commerce/products', { method: 'POST', token: c, body: {
+      name: `Pièce sans tarif ${run}`, sku: sku('NOPRICE'), categoryId: showcaseCategory.id, priceAriary: 0, stockQuantity: 3, status: 'published',
+    } });
+    assert.equal(noPrice.status, 409, 'pas de publication à 0 Ar comme produit commandable');
+    const showcase = await api('/commerce/products', { method: 'POST', token: c, body: {
+      name: `Pièce vitrine ${run}`, sku: sku('SHOW'), categoryId: showcaseCategory.id, priceAriary: 0, priceOnRequest: true,
+      stockQuantity: 3, status: 'published', featured: true,
+    } });
+    assert.equal(showcase.status, 201);
+    const publicView = await api(`/shop/products/${showcase.data.slug}`);
+    assert.equal(publicView.status, 200);
+    assert.equal(publicView.data.priceOnRequest, true);
+    assert.equal(publicView.data.priceAriary, 0);
+    assert.equal((await api(`/shop/products?orderable=1&q=${encodeURIComponent(showcase.data.sku)}`)).data.total, 0);
+    const before = (await api('/commerce/orders', { token: c })).data.total;
+    const attempt = await api('/shop/orders', { method: 'POST', ip: nextIp(), body: {
+      firstName: 'Client', lastName: 'Vitrine', phone: '0341234567', items: [{ productId: showcase.data.id, quantity: 1 }],
+    } });
+    assert.equal(attempt.status, 409);
+    assert.equal((await api('/commerce/orders', { token: c })).data.total, before, 'aucune commande créée');
+    assert.equal((await api(`/commerce/products/${showcase.data.id}`, { method: 'PATCH', token: c, body: { priceOnRequest: false } })).status, 409);
+    assert.equal((await api(`/shop/products/${showcase.data.slug}`)).data.priceOnRequest, true);
+  });
   await t.test('recherche, filtres, tri et pagination publics', async () => {
     const bySku = await api(`/shop/products?q=${encodeURIComponent(sku('flt'))}`);
     assert.deepEqual(bySku.data.items.map(item => item.id), [specific.id]);

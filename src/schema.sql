@@ -446,6 +446,7 @@ CREATE TABLE IF NOT EXISTS shop_products (
   category_id uuid NOT NULL REFERENCES shop_categories(id),
   brand_id uuid REFERENCES shop_brands(id),
   price_ariary integer NOT NULL CHECK (price_ariary >= 0),
+  price_on_request boolean NOT NULL DEFAULT false,
   compare_at_price_ariary integer CHECK (compare_at_price_ariary IS NULL OR compare_at_price_ariary > price_ariary),
   stock_quantity integer NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
   compatibility_type text NOT NULL DEFAULT 'universal' CHECK (compatibility_type IN ('universal','vehicle_specific')),
@@ -457,6 +458,7 @@ CREATE TABLE IF NOT EXISTS shop_products (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS price_on_request boolean NOT NULL DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS shop_products_sku_unique ON shop_products(upper(sku));
 CREATE UNIQUE INDEX IF NOT EXISTS shop_products_slug_unique ON shop_products(slug);
 CREATE INDEX IF NOT EXISTS shop_products_category_idx ON shop_products(category_id, status);
