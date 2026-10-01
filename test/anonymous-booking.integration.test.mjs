@@ -9,7 +9,8 @@ const suffix = String(Date.now()).slice(-6);
 
 function dateFor(weekday) {
   const date = new Date(); const delta = (weekday - date.getDay() + 7) % 7 || 7;
-  date.setDate(date.getDate() + delta); return date.toISOString().slice(0, 10);
+  // Local calendar date: toISOString() is UTC and shifts the day between 00:00 and 03:00 in Antananarivo.
+  date.setDate(date.getDate() + delta); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 const monday = dateFor(1), tuesday = dateFor(2), wednesday = dateFor(3), thursday = dateFor(4), friday = dateFor(5), saturday = dateFor(6), sunday = dateFor(0);
 async function api(path, { method = 'GET', body, ip = '198.51.100.10' } = {}) {

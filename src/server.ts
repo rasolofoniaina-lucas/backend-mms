@@ -1094,7 +1094,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (method === 'POST' && parts[2] === 'phone-change' && parts[3] === 'request-otp') { const auth = await identity(req); return send(res, 200, await createChallenge(req, await body(req), 'phone_change', auth.userId)); }
     if (method === 'POST' && parts[2] === 'phone-change' && parts[3] === 'verify-otp') { const auth = await identity(req); return send(res, 200, await verifyChallenge(req, await body(req), 'phone_change', res, auth.userId)); }
     if (method === 'POST' && parts[2] === 'refresh') {
-      limit(`refresh:${clientIp(req)}`, 30, 15 * 60_000); const token = cookie(req, 'mms_refresh'); if (!token) throw new HttpError(401, 'Session expirée.');
+      // Every page load tries a refresh. Visitors without a cookie are answered without touching the
+      // database or the limiter, and the per-IP ceiling stays far above normal reload/tab usage.
+      const token = cookie(req, 'mms_refresh'); if (!token) throw new HttpError(401, 'Session expirée.');
+      limit(`refresh:${clientIp(req)}`, 300, 15 * 60_000);
       const hash = createHmac('sha256', accessSecret).update(token).digest('hex');
       const found = await pool.query(`UPDATE user_sessions s SET revoked_at=now() FROM users u
         LEFT JOIN customers c ON c.user_id=u.id LEFT JOIN local_credentials lc ON lc.user_id=u.id
