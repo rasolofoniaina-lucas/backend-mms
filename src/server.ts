@@ -776,7 +776,8 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
   if (method === 'POST' && parts[2] === 'change-password' && parts.length === 3) {
     limit(`staff-password:${auth.userId}`, 8, 15 * 60_000);
     const input = await body(req);
-    if (!validPassword(input.newPassword) || input.newPassword === input.currentPassword) throw new HttpError(400, 'Le nouveau mot de passe doit contenir au moins 12 caractères et différer de l’ancien.');
+    if (!validPassword(input.newPassword)) throw new HttpError(400, 'Le nouveau mot de passe doit contenir entre 12 et 128 caractères.');
+    if (input.newPassword === input.currentPassword) throw new HttpError(400, 'Le nouveau mot de passe doit être différent du mot de passe actuel.');
     const found = await pool.query('SELECT password_hash FROM local_credentials WHERE user_id=$1', [auth.userId]);
     if (!found.rowCount || !await verifyPassword(found.rows[0].password_hash, String(input.currentPassword || ''))) throw new HttpError(401, 'Mot de passe actuel incorrect.');
     const digest = await hashPassword(input.newPassword);
