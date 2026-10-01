@@ -7,11 +7,13 @@
     "start": "node dist/server.js",
     "admin:create": "node dist/admin-create.js",
     "dev": "tsx watch src/server.ts",
-    "test:unit": "node --import tsx --test test/sms-provider.test.mjs test/phone-normalization.test.mjs test/staff-domain.test.mjs test/facebook-auth.test.mjs",
+    "test:unit": "node --import tsx --test test/sms-provider.test.mjs test/phone-normalization.test.mjs test/staff-domain.test.mjs test/facebook-auth.test.mjs test/shop-domain.test.mjs",
     "test:integration": "node --test test/auth.integration.test.mjs",
     "test:facebook-integration": "node --test test/facebook.integration.test.mjs",
     "test:staff-integration": "node --test test/staff-tickets.integration.test.mjs",
-    "test:b1": "sh test/run-b1-isolated.sh"
+    "test:b1": "sh test/run-b1-isolated.sh",
+    "shop:seed": "node dist/shop-seed.js",
+    "test:shop-integration": "node --test test/shop.integration.test.mjs"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.2.1",
