@@ -6,6 +6,7 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { Pool } from 'pg';
 import { normalizeMalagasyPhone } from './phone.js';
+import { removeCustomerVehicle } from './vehicle-removal.js';
 import { createSmsProvider, SmsProviderError } from './sms-provider.js';
 import { FacebookOAuthError, facebookAuthorizationUrl, facebookConfig, fetchFacebookProfile, type FacebookConfig } from './facebook-auth.js';
 import { HttpError, integerField, textField } from './http.js';
@@ -250,7 +251,7 @@ async function customerExists(id: string) {
 }
 async function vehicleData(customerId: string, vehicleId: string) {
   const result = await pool.query(`SELECT ${vehicleFields} FROM vehicles v
-    LEFT JOIN vehicle_photos p ON p.vehicle_id = v.id WHERE v.customer_id = $1 AND v.id = $2`, [customerId, vehicleId]);
+    LEFT JOIN vehicle_photos p ON p.vehicle_id = v.id WHERE v.customer_id = $1 AND v.id = $2 AND v.deleted_at IS NULL`, [customerId, vehicleId]);
   if (!result.rowCount) throw new HttpError(404, 'Moto introuvable pour ce client.');
   return result.rows[0];
 }
@@ -260,7 +261,7 @@ async function customerData(id: string) {
   if (!customer.rowCount) throw new HttpError(404, 'Client introuvable.');
   const [vehicles, appointments, maintenance, messages, tickets] = await Promise.all([
     pool.query(`SELECT ${vehicleFields} FROM vehicles v LEFT JOIN vehicle_photos p ON p.vehicle_id = v.id
-      WHERE v.customer_id = $1 ORDER BY v.created_at`, [id]),
+      WHERE v.customer_id = $1 AND v.deleted_at IS NULL ORDER BY v.created_at`, [id]),
     pool.query(`SELECT id, vehicle_id AS "vehicleId", problem, diagnosis, kind, address,
       to_char(appointment_date, 'YYYY-MM-DD') AS date, to_char(appointment_time, 'HH24:MI') AS time,
       status, contact_phone AS "contactPhone", immobilized, mechanic_note AS "mechanicNote"
@@ -1206,10 +1207,14 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     }
     if (parts[3] === 'vehicles' && parts[4] && parts.length >= 5) {
       const vehicleId = uuid(parts[4]);
+      if (method === 'DELETE' && parts.length === 5) {
+        await removeCustomerVehicle(pool, customerId, vehicleId);
+        return send(res, 200, { ok: true });
+      }
       if (method === 'PATCH' && parts.length === 5) {
         const input = vehicleInput(await body(req));
         const updated = await pool.query(`UPDATE vehicles SET name = $3, model = $4, plate = $5,
-          displacement_cc = $6, production_year = $7 WHERE id = $1 AND customer_id = $2 RETURNING id`,
+          displacement_cc = $6, production_year = $7 WHERE id = $1 AND customer_id = $2 AND deleted_at IS NULL RETURNING id`,
         [vehicleId, customerId, input.name, input.model, input.plate, input.displacementCc, input.year]);
         if (!updated.rowCount) throw new HttpError(404, 'Moto introuvable pour ce client.');
         return send(res, 200, await vehicleData(customerId, vehicleId));
@@ -1217,7 +1222,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       if (parts[5] === 'photo' && parts.length === 6) {
         if (method === 'GET') {
           const photo = await pool.query(`SELECT p.mime_type, p.image_data FROM vehicle_photos p
-            JOIN vehicles v ON v.id = p.vehicle_id WHERE v.id = $1 AND v.customer_id = $2`, [vehicleId, customerId]);
+            JOIN vehicles v ON v.id = p.vehicle_id WHERE v.id = $1 AND v.customer_id = $2 AND v.deleted_at IS NULL`, [vehicleId, customerId]);
           if (!photo.rowCount) throw new HttpError(404, 'Photo introuvable.');
           const bytes: Buffer = photo.rows[0].image_data;
           res.writeHead(200, { 'Content-Type': photo.rows[0].mime_type, 'Content-Length': bytes.length,
@@ -1228,9 +1233,16 @@ async function route(req: IncomingMessage, res: ServerResponse) {
           await vehicleData(customerId, vehicleId);
           const mimeType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
           const image = await photoBody(req, mimeType);
-          await pool.query(`INSERT INTO vehicle_photos (vehicle_id, mime_type, image_data) VALUES ($1, $2, $3)
-            ON CONFLICT (vehicle_id) DO UPDATE SET mime_type = EXCLUDED.mime_type,
-              image_data = EXCLUDED.image_data, updated_at = now()`, [vehicleId, mimeType, image]);
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+            const vehicle = await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL FOR UPDATE', [vehicleId, customerId]);
+            if (!vehicle.rowCount) throw new HttpError(404, 'Moto introuvable pour ce client.');
+            await client.query(`INSERT INTO vehicle_photos (vehicle_id, mime_type, image_data) VALUES ($1, $2, $3)
+              ON CONFLICT (vehicle_id) DO UPDATE SET mime_type = EXCLUDED.mime_type,
+                image_data = EXCLUDED.image_data, updated_at = now()`, [vehicleId, mimeType, image]);
+            await client.query('COMMIT');
+          } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
           return send(res, 200, await vehicleData(customerId, vehicleId));
         }
         if (method === 'DELETE') {
@@ -1243,7 +1255,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (method === 'POST' && parts[3] === 'appointments' && parts.length === 4) {
       const input = await body(req);
       const vehicleId = uuid(typeof input.vehicleId === 'string' ? input.vehicleId : undefined);
-      const vehicle = await pool.query('SELECT 1 FROM vehicles WHERE id = $1 AND customer_id = $2', [vehicleId, customerId]);
+      const vehicle = await pool.query('SELECT 1 FROM vehicles WHERE id = $1 AND customer_id = $2 AND deleted_at IS NULL', [vehicleId, customerId]);
       if (!vehicle.rowCount) throw new HttpError(400, 'Moto introuvable pour ce client.');
       const problem = textField(input.problem, 'Description de la panne', 10, 2000);
       const diagnosis = textField(input.diagnosis, 'Orientation', 0, 500);
@@ -1270,6 +1282,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        const activeVehicle = await client.query('SELECT id FROM vehicles WHERE id=$1 AND customer_id=$2 AND deleted_at IS NULL FOR UPDATE', [vehicleId, customerId]);
+        if (!activeVehicle.rowCount) throw new HttpError(404, 'Moto introuvable pour ce client.');
         await client.query(`INSERT INTO appointments (id, customer_id, vehicle_id, problem, diagnosis, kind, address,
           appointment_date, appointment_time, status, contact_phone, immobilized)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,

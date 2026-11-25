@@ -13,7 +13,8 @@
     "test:staff-integration": "node --test test/staff-tickets.integration.test.mjs",
     "test:b1": "sh test/run-b1-isolated.sh",
     "shop:seed": "node dist/shop-seed.js",
-    "test:shop-integration": "node --test test/shop.integration.test.mjs"
+    "test:shop-integration": "node --test test/shop.integration.test.mjs",
+    "test:vehicles-integration": "node --test test/vehicle-removal.integration.test.mjs"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.2.1",

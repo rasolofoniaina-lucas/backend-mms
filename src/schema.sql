@@ -269,6 +269,8 @@ CREATE TABLE IF NOT EXISTS vehicles (
 -- Existing motorcycles remain readable; these required fields are enforced for new/edited rows by the API.
 ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS displacement_cc integer;
 ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS production_year integer;
+-- Garage removal keeps only vehicle references required by historical tickets.
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS vehicle_photos (
   vehicle_id uuid PRIMARY KEY REFERENCES vehicles(id) ON DELETE CASCADE,
