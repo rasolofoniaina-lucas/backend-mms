@@ -54,6 +54,50 @@ export function canTransition(from: TicketStatus, to: TicketStatus, role: Role):
   if (role === 'workshop_manager') return true;
   return false; // Admin is not an atelier operator.
 }
+export function allowedTransitions(from: TicketStatus, role: Role): TicketStatus[] {
+  return (transitions[from] || []).filter(to => canTransition(from, to, role));
+}
+
+/** The workshop manager assigns straight from a new request: "triage" is an optional step, not a mandatory click. */
+export const assignableStatuses: readonly TicketStatus[] = ['new', 'triage', 'assigned'];
+export function canAssign(status: TicketStatus): boolean {
+  return assignableStatuses.includes(status);
+}
+
+export const waitingReasons = {
+  quote: 'Devis à valider par le client',
+  parts: 'Pièce à commander',
+  unreachable: 'Client injoignable',
+  vehicle: 'Moto non disponible',
+  other: 'Autre raison',
+} as const;
+export type WaitingReason = keyof typeof waitingReasons;
+export function isWaitingReason(value: unknown): value is WaitingReason {
+  return typeof value === 'string' && Object.hasOwn(waitingReasons, value);
+}
+
+export type Completion = { operations: string[]; mileageKm: number | null; note: string; customerMessage: string };
+/** Validates the closing form sent by the mechanic. Returns null when no completion form was sent. */
+export function parseCompletion(value: unknown): Completion | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('Fiche de clôture invalide.');
+  const raw = value as Record<string, unknown>;
+  const operations = Array.isArray(raw.operations) ? raw.operations : [];
+  if (operations.length > 20 || operations.some(item => typeof item !== 'string' || !item.trim() || item.length > 80)) throw new Error('Liste des travaux invalide.');
+  const mileage = raw.mileageKm === undefined || raw.mileageKm === null || raw.mileageKm === '' ? null : Number(raw.mileageKm);
+  if (mileage !== null && (!Number.isInteger(mileage) || mileage < 0 || mileage > 2_000_000)) throw new Error('Kilométrage invalide.');
+  const note = typeof raw.note === 'string' ? raw.note.trim() : '';
+  const customerMessage = typeof raw.customerMessage === 'string' ? raw.customerMessage.trim() : '';
+  if (note.length > 2000 || customerMessage.length > 2000) throw new Error('Texte trop long (2000 caractères maximum).');
+  return { operations: [...new Set((operations as string[]).map(item => item.trim()))], mileageKm: mileage, note, customerMessage };
+}
+/** Maintenance book line created when a ticket is closed. */
+export function maintenanceEntry(completion: Completion, interventionType: string) {
+  const title = completion.operations.length ? completion.operations.join(', ').slice(0, 200) : `Intervention ${interventionType.toLowerCase()}`;
+  const note = [completion.note, completion.mileageKm !== null ? `Kilométrage : ${completion.mileageKm.toLocaleString('fr-FR')} km` : ''].filter(Boolean).join('\n');
+  return { title, note };
+}
+
 export const ticketLabels: Record<TicketStatus, string> = {
   new: 'Nouveau', triage: 'À qualifier', assigned: 'Assigné', in_progress: 'En cours',
   waiting_customer: 'En attente client', completed: 'Terminé', cancelled: 'Annulé',

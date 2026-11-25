@@ -135,13 +135,42 @@ test('Phase A : auth staff, RBAC, tickets et historique local', async t => {
   await t.test('A traite, transitions invalides refusées, client voit terminé', async () => {
     assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'completed' } })).status, 409);
     assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'in_progress' } })).status, 200);
-    assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'waiting_customer' } })).status, 200);
+    assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'waiting_customer' } })).status, 400);
+    assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'waiting_customer', reason: 'parts' } })).status, 200);
+    assert.equal((await api(`/customers/${clientId}/tickets/${ticket.reference}`, { token: client.data.accessToken })).data.waitingReason, 'parts');
     assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'in_progress' } })).status, 200);
-    assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'completed' } })).status, 200);
+    assert.equal((await api(`/staff/tickets/${ticket.reference}/note`, { method: 'PATCH', token: mecaA.data.accessToken, body: { internalNote: 'Note atelier confidentielle' } })).status, 200);
+    const staffDetail = await api(`/staff/tickets/${ticket.reference}`, { token: mecaA.data.accessToken });
+    assert.equal(staffDetail.data.internalNote, 'Note atelier confidentielle');
+    assert.equal(staffDetail.data.waitingReason, null);
+    assert.deepEqual(staffDetail.data.allowedTransitions, ['waiting_customer', 'completed']);
+    assert.equal(staffDetail.data.address, 'Atelier de recette local');
+    assert.equal(staffDetail.data.immobilized, true);
+    assert.ok(staffDetail.data.events.some(event => event.actorName));
+    assert.equal((await api(`/staff/tickets/${ticket.reference}/status`, { method: 'PATCH', token: mecaA.data.accessToken, body: { status: 'completed', completion: { operations: ['Diagnostic', 'Vidange'], mileageKm: 8200, note: 'Filtre remplacé', customerMessage: 'Votre moto est prête.' } } })).status, 200);
     const detail = await api(`/customers/${clientId}/tickets/${ticket.reference}`, { token: client.data.accessToken });
     assert.equal(detail.data.status, 'completed');
+    assert.equal(detail.data.publicNote, 'Votre moto est prête.');
+    assert.equal(detail.data.internalNote, undefined);
+    assert.equal(detail.data.vehiclePhotoUrl, undefined);
     assert.ok(detail.data.events.length >= 7);
+    assert.ok(detail.data.events.every(event => event.actorName === undefined));
     assert.equal(detail.data.customerPhone, undefined);
+    const book = (await api(`/customers/${clientId}`, { token: client.data.accessToken })).data.maintenance;
+    const line = book.find(entry => entry.vehicleId === vehicle.data.id);
+    assert.equal(line.title, 'Diagnostic, Vidange');
+    assert.match(line.note, /Kilométrage/);
+  });
+  await t.test('le chef assigne directement une nouvelle demande', async () => {
+    const created = await api(`/customers/${clientId}/appointments`, { method: 'POST', token: client.data.accessToken, body: { vehicleId: vehicle.data.id, problem: 'Assignation directe en recette', diagnosis: '', kind: 'Urgence', address: 'Adresse de recette', contactPhone: phone, immobilized: false } });
+    assert.equal(created.status, 201);
+    const reference = created.data.ticket.reference;
+    assert.equal((await api(`/staff/tickets/${reference}`, { token: chef.data.accessToken })).data.canAssign, true);
+    assert.equal((await api(`/staff/tickets/${reference}/assign`, { method: 'PATCH', token: chef.data.accessToken, body: { mechanicUserId: aCreated.id } })).status, 200);
+    assert.equal((await api(`/staff/tickets/${reference}`, { token: chef.data.accessToken })).data.status, 'assigned');
+    const workload = (await api('/staff/mechanics', { token: chef.data.accessToken })).data.find(row => row.id === aCreated.id);
+    assert.ok(workload.activeTickets >= 1);
+    assert.equal((await api(`/staff/tickets/${reference}/status`, { method: 'PATCH', token: chef.data.accessToken, body: { status: 'cancelled' } })).status, 200);
   });
   await t.test('création concurrente : références uniques', async () => {
     const payload = { vehicleId: vehicle.data.id, problem: 'Demande concurrente de recette MMS', diagnosis: '', kind: 'Urgence', address: 'Adresse de recette locale', contactPhone: phone, immobilized: true };

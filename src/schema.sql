@@ -353,6 +353,14 @@ CREATE TABLE IF NOT EXISTS ticket_events (
 );
 CREATE INDEX IF NOT EXISTS ticket_events_ticket_idx ON ticket_events(ticket_id, created_at, id);
 
+-- Workshop autonomy (additive): staff-only note, reason for "waiting customer",
+-- and a maintenance book line created when a ticket is closed.
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS internal_note text NOT NULL DEFAULT '';
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS waiting_reason text;
+ALTER TABLE maintenance ADD COLUMN IF NOT EXISTS ticket_id uuid REFERENCES tickets(id) ON DELETE SET NULL;
+ALTER TABLE maintenance ADD COLUMN IF NOT EXISTS mileage_km integer;
+CREATE UNIQUE INDEX IF NOT EXISTS maintenance_ticket_unique ON maintenance(ticket_id) WHERE ticket_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS admin_audit_events (
   id bigserial PRIMARY KEY,
   actor_user_id uuid REFERENCES users(id),

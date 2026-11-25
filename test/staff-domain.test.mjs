@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { canTransition, hashPassword, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword } from '../src/staff-domain.ts';
+import { allowedTransitions, canAssign, canTransition, isWaitingReason, maintenanceEntry, parseCompletion, hashPassword, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword } from '../src/staff-domain.ts';
 
 test('username staff et email facultatif normalisés', () => {
   assert.equal(staffUsername(' JRakoto '), 'jrakoto');
@@ -30,4 +30,33 @@ test('transitions RBAC tickets', () => {
   assert.equal(canTransition('assigned','completed','mechanic'), false);
   assert.equal(canTransition('in_progress','completed','admin'), false);
   assert.equal(canTransition('completed','in_progress','workshop_manager'), false);
+});
+test('actions proposées selon le rôle', () => {
+  assert.deepEqual(allowedTransitions('assigned', 'mechanic'), ['in_progress']);
+  assert.deepEqual(allowedTransitions('in_progress', 'mechanic'), ['waiting_customer', 'completed']);
+  assert.deepEqual(allowedTransitions('in_progress', 'admin'), []);
+  assert.deepEqual(allowedTransitions('completed', 'workshop_manager'), []);
+});
+test('le chef assigne directement une nouvelle demande', () => {
+  assert.ok(canAssign('new'));
+  assert.ok(canAssign('triage'));
+  assert.ok(canAssign('assigned'));
+  assert.equal(canAssign('in_progress'), false);
+  assert.equal(canAssign('completed'), false);
+});
+test('motif d’attente obligatoire et contrôlé', () => {
+  assert.ok(isWaitingReason('parts'));
+  assert.equal(isWaitingReason('toString'), false);
+  assert.equal(isWaitingReason(''), false);
+});
+test('fiche de clôture et ligne de carnet', () => {
+  assert.equal(parseCompletion(undefined), null);
+  const completion = parseCompletion({ operations: ['Vidange', ' Vidange ', 'Freins'], mileageKm: '12500', note: ' RAS ', customerMessage: 'Moto prête.' });
+  assert.deepEqual(completion, { operations: ['Vidange', 'Freins'], mileageKm: 12500, note: 'RAS', customerMessage: 'Moto prête.' });
+  const entry = maintenanceEntry(completion, 'En atelier');
+  assert.equal(entry.title, 'Vidange, Freins');
+  assert.match(entry.note, /^RAS\nKilométrage : 12\s?500 km$/u);
+  assert.equal(maintenanceEntry(parseCompletion({}), 'À domicile').title, 'Intervention à domicile');
+  assert.throws(() => parseCompletion({ mileageKm: -3 }), /Kilométrage/);
+  assert.throws(() => parseCompletion({ operations: [42] }), /travaux/);
 });

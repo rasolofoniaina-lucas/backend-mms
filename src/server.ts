@@ -11,7 +11,7 @@ import { createSmsProvider, SmsProviderError } from './sms-provider.js';
 import { FacebookOAuthError, facebookAuthorizationUrl, facebookConfig, fetchFacebookProfile, type FacebookConfig } from './facebook-auth.js';
 import { HttpError, integerField, textField } from './http.js';
 import { commerceRoute, shopRoute, type ShopDeps } from './shop.js';
-import { canTransition, hashPassword, isStaffRole, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword, type Role, type TicketStatus } from './staff-domain.js';
+import { allowedTransitions, canAssign, canTransition, hashPassword, isWaitingReason, maintenanceEntry, parseCompletion, isStaffRole, staffEmail, staffUsername, temporaryPassword, validPassword, verifyPassword, type Role, type TicketStatus } from './staff-domain.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL est requis.');
 if (!process.env.OTP_PEPPER || !process.env.ACCESS_TOKEN_SECRET) throw new Error('OTP_PEPPER et ACCESS_TOKEN_SECRET sont requis.');
@@ -171,8 +171,10 @@ function ticketReference(sequence: string, date = new Date()) {
   return `MMS-${date.getFullYear()}-${sequence.padStart(6, '0')}`;
 }
 async function ticketEvents(ticketId: string, publicView = false) {
-  const result = await pool.query(`SELECT event_type AS "eventType",old_value AS "oldValue",new_value AS "newValue",
-    created_at AS "createdAt" FROM ticket_events WHERE ticket_id=$1 ORDER BY created_at,id`, [ticketId]);
+  const result = await pool.query(`SELECT e.event_type AS "eventType",e.old_value AS "oldValue",e.new_value AS "newValue",
+    e.created_at AS "createdAt",NULLIF(concat_ws(' ',u.first_name,u.last_name),'') AS "actorName"
+    FROM ticket_events e LEFT JOIN users u ON u.id=e.actor_user_id AND u.role<>'customer'
+    WHERE e.ticket_id=$1 ORDER BY e.created_at,e.id`, [ticketId]);
   return publicView ? result.rows.map(row => ({ eventType: row.eventType,
     oldValue: row.eventType === 'status_changed' || row.eventType === 'ticket_cancelled' || row.eventType === 'ticket_completed' ? row.oldValue : null,
     newValue: row.eventType === 'status_changed' || row.eventType === 'ticket_created' || row.eventType === 'ticket_cancelled' || row.eventType === 'ticket_completed' ? row.newValue : null,
@@ -183,14 +185,24 @@ const ticketColumns = `t.id,t.reference,t.customer_id AS "customerId",t.vehicle_
   t.assigned_mechanic_user_id AS "assignedMechanicUserId",t.created_at AS "createdAt",t.updated_at AS "updatedAt",
   t.completed_at AS "completedAt",t.cancelled_at AS "cancelledAt",
   c.name AS "customerName",c.phone AS "customerPhone",v.name AS "vehicleName",v.model AS "vehicleModel",
-  a.appointment_date AS "appointmentDate",a.appointment_time AS "appointmentTime",a.mechanic_note AS "publicNote",
+  to_char(a.appointment_date,'YYYY-MM-DD') AS "appointmentDate",to_char(a.appointment_time,'HH24:MI') AS "appointmentTime",a.mechanic_note AS "publicNote",
+  v.plate AS "vehiclePlate",a.address,a.contact_phone AS "contactPhone",a.immobilized,a.diagnosis,
+  t.internal_note AS "internalNote",t.waiting_reason AS "waitingReason",
+  CASE WHEN p.vehicle_id IS NOT NULL THEN '/api/staff/tickets/' || t.reference || '/vehicle-photo?updated=' ||
+    (extract(epoch from p.updated_at) * 1000)::bigint ELSE NULL END AS "vehiclePhotoUrl",
   concat_ws(' ',m.first_name,m.last_name) AS "mechanicName"`;
 const ticketJoin = `FROM tickets t JOIN customers c ON c.id=t.customer_id JOIN vehicles v ON v.id=t.vehicle_id
+  LEFT JOIN vehicle_photos p ON p.vehicle_id=v.id
   LEFT JOIN appointments a ON a.id=t.appointment_id LEFT JOIN users m ON m.id=t.assigned_mechanic_user_id`;
 function customerTicket(row: Record<string, unknown>) {
-  const { customerName, customerPhone, assignedMechanicUserId, mechanicName, ...safe } = row;
-  void customerName; void customerPhone; void assignedMechanicUserId; void mechanicName;
+  // Staff-only fields never reach the customer: internal note, mechanic identity, staff photo URL.
+  const { customerName, customerPhone, assignedMechanicUserId, mechanicName, internalNote, vehiclePhotoUrl, ...safe } = row;
+  void customerName; void customerPhone; void assignedMechanicUserId; void mechanicName; void internalNote; void vehiclePhotoUrl;
   return safe;
+}
+function withTransitions(ticket: Record<string, unknown>, role: Role) {
+  return { ...ticket, allowedTransitions: allowedTransitions(ticket.status as TicketStatus, role),
+    canAssign: role === 'workshop_manager' && canAssign(ticket.status as TicketStatus) };
 }
 async function staffTicket(reference: string, auth: Identity, lock = false, client?: import('pg').PoolClient) {
   const db = client || pool;
@@ -271,7 +283,8 @@ async function customerData(id: string) {
     pool.query('SELECT body FROM messages WHERE customer_id = $1 ORDER BY id', [id]),
     pool.query(`SELECT t.id,t.reference,t.appointment_id AS "appointmentId",t.vehicle_id AS "vehicleId",
       t.intervention_type AS "interventionType",t.description,t.status,t.created_at AS "createdAt",
-      a.appointment_date AS "appointmentDate",a.appointment_time AS "appointmentTime",a.mechanic_note AS "publicNote"
+      to_char(a.appointment_date,'YYYY-MM-DD') AS "appointmentDate",to_char(a.appointment_time,'HH24:MI') AS "appointmentTime",a.mechanic_note AS "publicNote",
+      t.waiting_reason AS "waitingReason"
       FROM tickets t LEFT JOIN appointments a ON a.id=t.appointment_id
       WHERE t.customer_id=$1 ORDER BY t.created_at DESC`, [id]),
   ]);
@@ -806,8 +819,10 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
   }
   if (method === 'GET' && parts[2] === 'mechanics' && parts.length === 3) {
     if (auth.role !== 'workshop_manager') throw new HttpError(403, 'Accès refusé.');
-    const rows = await pool.query(`SELECT id,concat_ws(' ',first_name,last_name) AS name FROM users
-      WHERE role='mechanic' AND status='active' ORDER BY first_name,last_name`);
+    const rows = await pool.query(`SELECT u.id,concat_ws(' ',u.first_name,u.last_name) AS name,
+      count(t.id) FILTER (WHERE t.status IN ('assigned','in_progress','waiting_customer'))::integer AS "activeTickets"
+      FROM users u LEFT JOIN tickets t ON t.assigned_mechanic_user_id=u.id
+      WHERE u.role='mechanic' AND u.status='active' GROUP BY u.id ORDER BY u.first_name,u.last_name`);
     return send(res, 200, rows.rows);
   }
   if (method === 'GET' && parts[2] === 'summary' && parts.length === 3) {
@@ -817,6 +832,7 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       count(*) FILTER (WHERE assigned_mechanic_user_id IS NULL AND status NOT IN ('completed','cancelled'))::integer AS unassigned,
       count(*) FILTER (WHERE status='in_progress')::integer AS progress,
       count(*) FILTER (WHERE status='waiting_customer')::integer AS waiting,
+      count(*) FILTER (WHERE intervention_type='Urgence' AND status NOT IN ('completed','cancelled'))::integer AS urgent,
       count(*) FILTER (WHERE status='completed' AND completed_at::date=CURRENT_DATE)::integer AS "doneToday"
       FROM tickets`);
     return send(res, 200, result.rows[0]);
@@ -841,6 +857,7 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       const input = await body(req); const day=textField(input.day,'Date',10,10); if(!datePattern.test(day)) throw new HttpError(400,'Date invalide.'); const open=input.isOpen===true; const opens=open?textField(input.opensAt,'Ouverture',5,5):null; const closes=open?textField(input.closesAt,'Fermeture',5,5):null; if(open && (!/^\d\d:\d\d$/.test(opens!) || !/^\d\d:\d\d$/.test(closes!) || opens!>=closes!)) throw new HttpError(400,'Horaires invalides.'); await pool.query(`INSERT INTO workshop_schedule_exceptions(day,opens_at,closes_at,is_open,reason,created_by_user_id) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(day) DO UPDATE SET opens_at=excluded.opens_at,closes_at=excluded.closes_at,is_open=excluded.is_open,reason=excluded.reason,created_by_user_id=excluded.created_by_user_id`,[day,opens,closes,open,textField(input.reason??'','Motif',0,300),auth.userId]); return send(res,201,{ok:true});
     }
     if (method === 'POST' && parts[3] === 'blocks' && parts.length === 4) { const input=await body(req); const day=textField(input.date,'Date',10,10), time=textField(input.time,'Créneau',5,5); if(!datePattern.test(day)||!/^\d\d:\d\d$/.test(time)) throw new HttpError(400,'Créneau invalide.'); await pool.query(`INSERT INTO blocked_slots(id,slot_date,slot_time,reason,created_by_user_id) VALUES($1,$2,$3,$4,$5)`,[randomUUID(),day,time,textField(input.reason??'','Motif',0,300),auth.userId]); return send(res,201,{ok:true}); }
+    if (method === 'DELETE' && parts[3] === 'exceptions' && parts[4] && parts.length === 5) { const day=textField(parts[4],'Date',10,10); if(!datePattern.test(day)) throw new HttpError(400,'Date invalide.'); await pool.query('DELETE FROM workshop_schedule_exceptions WHERE day=$1',[day]); return send(res,200,{ok:true}); }
     if (method === 'DELETE' && parts[3] === 'blocks' && parts[4] && parts.length === 5) { await pool.query('DELETE FROM blocked_slots WHERE id=$1',[uuid(parts[4])]); return send(res,200,{ok:true}); }
     throw new HttpError(404,'Route introuvable.');
   }
@@ -870,21 +887,41 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
     if (path.searchParams.get('status')) add('t.status=?', ticketStatus(path.searchParams.get('status')));
     if (path.searchParams.get('kind')) add('t.intervention_type=?', path.searchParams.get('kind'));
     if (auth.role === 'workshop_manager' && path.searchParams.get('mechanic')) add('t.assigned_mechanic_user_id=?', uuid(path.searchParams.get('mechanic')!));
-    if (path.searchParams.get('date')) add('t.created_at::date=?', textField(path.searchParams.get('date'), 'Date', 10, 10));
+    // The workshop thinks in appointment days: filter on the appointment date, falling back to the request date.
+    if (path.searchParams.get('date')) add('COALESCE(a.appointment_date,t.created_at::date)=?', textField(path.searchParams.get('date'), 'Date', 10, 10));
+    // Without an explicit status filter or search, closed tickets older than 14 days are left out to keep the board short.
+    if (!path.searchParams.get('status') && !path.searchParams.get('q')) conditions.push(`(t.status NOT IN ('completed','cancelled') OR t.updated_at > now() - interval '14 days')`);
     if (path.searchParams.get('q')) add('(t.reference ILIKE ? OR c.name ILIKE ?)', `%${textField(path.searchParams.get('q'), 'Recherche', 1, 80)}%`);
     const search = path.searchParams.get('q');
     if (search) { const i = values.length; conditions[conditions.length - 1] = `(t.reference ILIKE $${i} OR c.name ILIKE $${i})`; }
-    const rows = await pool.query(`SELECT ${ticketColumns} ${ticketJoin} WHERE ${conditions.join(' AND ')} ORDER BY t.created_at DESC LIMIT 200`, values);
-    return send(res, 200, rows.rows);
+    const closed = `t.status IN ('completed','cancelled')`;
+    const rows = await pool.query(`SELECT ${ticketColumns} ${ticketJoin} WHERE ${conditions.join(' AND ')}
+      ORDER BY ${closed}, CASE WHEN ${closed} THEN NULL ELSE t.intervention_type='Urgence' END DESC NULLS LAST,
+        CASE WHEN ${closed} THEN NULL ELSE COALESCE(a.appointment_date,t.created_at::date) END ASC,
+        CASE WHEN ${closed} THEN NULL ELSE a.appointment_time END ASC NULLS FIRST, t.updated_at DESC LIMIT 300`, values);
+    return send(res, 200, rows.rows.map(row => withTransitions(row, auth.role)));
   }
   if (parts.length < 4) throw new HttpError(404, 'Route introuvable.');
   const reference = textField(parts[3], 'Référence', 1, 40);
   if (method === 'GET' && parts.length === 4) {
     const ticket = await staffTicket(reference, auth);
-    return send(res, 200, { ...ticket, events: await ticketEvents(ticket.id) });
+    return send(res, 200, { ...withTransitions(ticket, auth.role), events: await ticketEvents(ticket.id) });
+  }
+  if (method === 'GET' && parts[4] === 'vehicle-photo' && parts.length === 5) {
+    const ticket = await staffTicket(reference, auth);
+    const photo = await pool.query('SELECT mime_type, image_data FROM vehicle_photos WHERE vehicle_id=$1', [ticket.vehicleId]);
+    if (!photo.rowCount) throw new HttpError(404, 'Photo introuvable.');
+    const bytes: Buffer = photo.rows[0].image_data;
+    res.writeHead(200, { 'Content-Type': photo.rows[0].mime_type, 'Content-Length': bytes.length, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    return res.end(bytes);
   }
   if (method === 'PATCH' && parts[4] === 'status' && parts.length === 5) {
-    const status = ticketStatus((await body(req)).status);
+    const input = await body(req);
+    const status = ticketStatus(input.status);
+    if (status === 'waiting_customer' && !isWaitingReason(input.reason)) throw new HttpError(400, 'Indiquez pourquoi le ticket attend le client.');
+    let completion: ReturnType<typeof parseCompletion> = null;
+    try { completion = status === 'completed' ? parseCompletion(input.completion) : null; }
+    catch (error) { throw new HttpError(400, (error as Error).message); }
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -893,8 +930,16 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       if (status === 'assigned' && !ticket.assignedMechanicUserId) throw new HttpError(409, 'Assignez d’abord un mécanicien.');
       await client.query(`UPDATE tickets SET status=$2,updated_at=now(),
         assigned_mechanic_user_id=CASE WHEN $2='triage' THEN NULL ELSE assigned_mechanic_user_id END,
+        waiting_reason=CASE WHEN $2='waiting_customer' THEN $3 ELSE NULL END,
         completed_at=CASE WHEN $2='completed' THEN now() ELSE completed_at END,
-        cancelled_at=CASE WHEN $2='cancelled' THEN now() ELSE cancelled_at END WHERE id=$1`, [ticket.id, status]);
+        cancelled_at=CASE WHEN $2='cancelled' THEN now() ELSE cancelled_at END WHERE id=$1`, [ticket.id, status, status === 'waiting_customer' ? input.reason : null]);
+      if (completion) {
+        const entry = maintenanceEntry(completion, ticket.interventionType);
+        await client.query(`INSERT INTO maintenance(id,customer_id,vehicle_id,title,maintenance_date,note,ticket_id,mileage_km)
+          VALUES($1,$2,$3,$4,CURRENT_DATE,$5,$6,$7) ON CONFLICT (ticket_id) WHERE ticket_id IS NOT NULL DO NOTHING`,
+          [randomUUID(), ticket.customerId, ticket.vehicleId, entry.title, entry.note, ticket.id, completion.mileageKm]);
+        if (completion.customerMessage && ticket.appointmentId) await client.query('UPDATE appointments SET mechanic_note=$2 WHERE id=$1', [ticket.appointmentId, completion.customerMessage]);
+      }
       await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,old_value,new_value)
         VALUES ($1,$2,$3,$4,$5)`, [ticket.id, auth.userId, status === 'completed' ? 'ticket_completed' : status === 'cancelled' ? 'ticket_cancelled' : 'status_changed', ticket.status, status]);
       if (status === 'triage' && ticket.assignedMechanicUserId) await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,old_value,new_value)
@@ -904,7 +949,7 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
         if (mapped[status]) await client.query('UPDATE appointments SET status=$2 WHERE id=$1', [ticket.appointmentId, mapped[status]]);
       }
       await client.query('COMMIT');
-      return send(res, 200, { ...ticket, status });
+      return send(res, 200, withTransitions({ ...ticket, status }, auth.role));
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   }
   if (method === 'PATCH' && parts[4] === 'assign' && parts.length === 5) {
@@ -916,7 +961,7 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
       const mechanic = await client.query(`SELECT 1 FROM users WHERE id=$1 AND role='mechanic' AND status='active'`, [mechanicId]);
       if (!mechanic.rowCount) throw new HttpError(400, 'Mécanicien indisponible.');
       const ticket = await staffTicket(reference, auth, true, client);
-      if (!['triage','assigned'].includes(ticket.status)) throw new HttpError(409, 'Qualifiez le ticket avant de l’assigner.');
+      if (!canAssign(ticket.status)) throw new HttpError(409, 'Ce ticket ne peut plus être assigné.');
       if (ticket.assignedMechanicUserId === mechanicId) throw new HttpError(409, 'Ce mécanicien est déjà assigné.');
       await client.query(`UPDATE tickets SET assigned_mechanic_user_id=$2,status='assigned',updated_at=now() WHERE id=$1`, [ticket.id, mechanicId]);
       await client.query(`INSERT INTO ticket_events(ticket_id,actor_user_id,event_type,old_value,new_value) VALUES ($1,$2,$3,$4,$5)`,
@@ -928,10 +973,16 @@ async function staffRoute(req: IncomingMessage, res: ServerResponse, parts: stri
     } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
   }
   if (method === 'PATCH' && parts[4] === 'note' && parts.length === 5) {
-    const note = textField((await body(req)).note, 'Note publique', 0, 2000);
+    // "note" is the message shown to the customer; "internalNote" stays inside the workshop.
+    const input = await body(req);
+    if (input.note === undefined && input.internalNote === undefined) throw new HttpError(400, 'Aucune note à enregistrer.');
     const ticket = await staffTicket(reference, auth);
-    if (!ticket.appointmentId) throw new HttpError(409, 'Ce ticket ne possède pas de demande liée.');
-    await pool.query('UPDATE appointments SET mechanic_note=$2 WHERE id=$1', [ticket.appointmentId, note]);
+    if (input.note !== undefined) {
+      const note = textField(input.note, 'Message au client', 0, 2000);
+      if (!ticket.appointmentId) throw new HttpError(409, 'Ce ticket ne possède pas de demande liée.');
+      await pool.query('UPDATE appointments SET mechanic_note=$2 WHERE id=$1', [ticket.appointmentId, note]);
+    }
+    if (input.internalNote !== undefined) await pool.query('UPDATE tickets SET internal_note=$2,updated_at=now() WHERE id=$1', [ticket.id, textField(input.internalNote, 'Note interne', 0, 4000)]);
     return send(res, 200, { ok: true });
   }
   throw new HttpError(404, 'Route introuvable.');
@@ -1169,7 +1220,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       const claim = randomBytes(32).toString('base64url'); const claimHash = createHmac('sha256', accessSecret).update(`booking:${claim}`).digest('hex');
       await client.query(`INSERT INTO booking_claims(id,customer_id,ticket_id,token_hash,expires_at) VALUES($1,$2,$3,$4,now()+interval '24 hours')`,[randomUUID(),customerId,ticketId,claimHash]);
       await client.query('COMMIT');
-      const result = await pool.query(`SELECT t.id,t.reference,t.appointment_id AS "appointmentId",t.vehicle_id AS "vehicleId",t.intervention_type AS "interventionType",t.description,t.status,t.created_at AS "createdAt",a.appointment_date AS "appointmentDate",a.appointment_time AS "appointmentTime" FROM tickets t LEFT JOIN appointments a ON a.id=t.appointment_id WHERE t.id=$1`, [ticketId]);
+      const result = await pool.query(`SELECT t.id,t.reference,t.appointment_id AS "appointmentId",t.vehicle_id AS "vehicleId",t.intervention_type AS "interventionType",t.description,t.status,t.created_at AS "createdAt",to_char(a.appointment_date,'YYYY-MM-DD') AS "appointmentDate",to_char(a.appointment_time,'HH24:MI') AS "appointmentTime" FROM tickets t LEFT JOIN appointments a ON a.id=t.appointment_id WHERE t.id=$1`, [ticketId]);
       return send(res, 201, { ticket: result.rows[0], appointmentId, bookingClaim: claim });
     } catch (error) { await client.query('ROLLBACK').catch(() => undefined); if ((error as {code?: string}).code === '23505') throw new HttpError(409, 'Ce créneau vient d’être réservé. Choisissez-en un autre.'); throw error; } finally { client.release(); }
   }
